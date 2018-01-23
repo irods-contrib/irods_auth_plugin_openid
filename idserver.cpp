@@ -12,6 +12,7 @@
 #include <curl/curl.h>
 
 #include <boost/algorithm/string.hpp>
+#include <boost/property_tree/json_parser.hpp>
 
 using namespace std;
 
@@ -200,7 +201,7 @@ string *get_access_token(string authorization_code)
     {
         curl_easy_setopt(curl, CURLOPT_URL, "https://www.googleapis.com/oauth2/v4/token");
         curl_easy_setopt(curl, CURLOPT_POST, 1L);
-        curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+        //curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, _curl_writefunction_callback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, response);
         //curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
@@ -213,8 +214,8 @@ string *get_access_token(string authorization_code)
 
         std::stringstream fields;// = new std::stringstream();
         fields << "code=" << curl_easy_escape(curl, authorization_code.c_str(), 0);
-        fields << "&client_id=" << curl_easy_escape(curl, XXX, 0);
-        fields << "&client_secret=" << curl_easy_escape(curl, XXX, 0);
+        fields << "&client_id=" << curl_easy_escape(curl, "118582272506-6vm4rruieahekajob0tghgdf3iogtdgt.apps.googleusercontent.com", 0);
+        fields << "&client_secret=" << curl_easy_escape(curl, "el7Fkt1q4KMozJ-M9uNJebWz", 0);
         fields << "&redirect_uri=" << curl_easy_escape(curl, "http://localhost:8080", 0);
         fields << "&grant_type=" << curl_easy_escape(curl, "authorization_code", 0);
         string *fields_string = new string(fields.str()); // Must be heap allocated. curl's COPYPOSTFIELDS didn't work
@@ -240,7 +241,6 @@ string *get_access_token(string authorization_code)
     }
     curl_global_cleanup();
 
-    cout << *response << endl;
     return response;
 }
 
@@ -252,8 +252,7 @@ int main(int argc, char **argv)
     struct sockaddr_in server_address;
     struct sockaddr_in client_address;
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    //fcntl(sockfd, F_SETFL, O_NONBLOCK);
-
+    
     memset(&server_address, 0, sizeof(server_address));
     server_address.sin_family = AF_INET;
     server_address.sin_addr.s_addr = htonl(INADDR_ANY);
@@ -298,9 +297,31 @@ int main(int argc, char **argv)
         if (param_map->find("code") != param_map->end())
         {
             string authorization_code = param_map->at("code");
-            cout << "Using authorization code to retrieve OAuth2 access token" << endl;
+            //cout << "Using authorization code to retrieve OAuth2 access token" << endl;
             string *access_token_response = get_access_token(authorization_code);
             cout << *access_token_response;
+            stringstream response_stream(*access_token_response);
+            
+            boost::property_tree::ptree response_tree;
+            boost::property_tree::read_json(response_stream, response_tree);
+            if (response_tree.find("access_token") == response_tree.not_found() 
+                  || response_tree.find("id_token") == response_tree.not_found()
+                  || response_tree.find("expires_in") == response_tree.not_found()) 
+            {
+                cout << "Token response missing required fields (access_token, expires_in, id_token)" << endl;
+            }
+            else
+            {
+                string id_token = response_tree.get<string>("id_token");
+                string access_token = response_tree.get<string>("access_token");
+                string expires_in = response_tree.get<string>("expires_in");
+                cout << "id_token: " << id_token << endl;
+                // TODO base64 decode and validate fields 
+                // https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation
+                cout << "access_token: " << access_token << endl;
+                cout << "expires_in: " << expires_in << endl;
+            }
+            delete access_token_response;
         }
         else
         {
