@@ -1,7 +1,6 @@
 //#define USE_SSL 1 (libpam.cpp)
 #include "sslSockComm.h"
 
-
 #include "authCheck.h"
 #include "authPluginRequest.h"
 #include "authRequest.h"
@@ -14,7 +13,7 @@
 #include "irods_client_server_negotiation.hpp"
 #include "irods_configuration_keywords.hpp"
 #include "irods_error.hpp"
-//#include "irods_generic_auth_object.hpp"
+#include "irods_generic_auth_object.hpp"
 #include "irods_kvp_string_parser.hpp"
 #include "irods_server_properties.hpp"
 #include "irods_stacktrace.hpp"
@@ -35,7 +34,6 @@
 
 ///OPENID includes
 //#include <iostream>
-//#include <string>
 #include <sstream>
 #include <map>
 #include <regex>
@@ -51,6 +49,22 @@
 #include <boost/format.hpp>
 ///END OPENID includes
 ///DECLARATIONS
+
+#ifdef RODS_SERVER
+// =-=-=-=-=-=-=-
+// NOTE:: this needs to become a property
+// Set requireServerAuth to 1 to fail authentications from
+// un-authenticated Servers (for example, if the LocalZoneSID
+// is not set)
+static const int requireServerAuth = 0;
+static int openidAuthReqStatus = 0;
+static int openidAuthReqError = 0;
+static const int openidAuthErrorSize = 1000;
+static char openidAuthReqErrorMsg[openidAuthErrorSize];
+#endif
+
+static const std::string AUTH_OPENID_SCHEME("openid");
+
 boost::property_tree::ptree *get_provider_metadata(std::string provider_metadata_url);
 
 void send_success(int sockfd);
@@ -66,20 +80,21 @@ std::string *get_access_token(std::string token_endpoint_url,
 
 boost::property_tree::ptree *get_provider_metadata(std::string provider_metadata_url);
 bool get_provider_metadata_field(std::string provider_metadata_url, const std::string fieldname, std::string& value);
+
+irods::error openid_authorize();
 ///END DECLARATIONS
 
 irods::error openid_auth_establish_context(
-    irods::plugin_context& _ctx )
-{
+    irods::plugin_context& _ctx ) {
+    std::cout << "entering openid_auth_establish_context" << std::endl;
     irods::error result = SUCCESS();
     irods::error ret;
 
-    ret = _ctx.valid<irods::openid_auth_object>();
-    if ( !_ctx.valid<irods::openid_auth_object>().ok())
-    {
+    ret = _ctx.valid<irods::generic_auth_object>();
+    if ( !ret.ok()) {
         return ERROR(SYS_INVALID_INPUT_PARAM, "Invalid plugin context.");
     }
-
+    std::cout << "leaving openid_auth_establish_context" << std::endl;
     return ret;
 }
 
@@ -88,16 +103,15 @@ irods::error openid_auth_client_start(
     rcComm_t*              _comm,
     const char*            _inst_name)
 {
+    std::cout << "entering openid_auth_client_start" << std::endl;
     irods::error result = SUCCESS();
     irods::error ret;
 
-    ret = _ctx.valid<irods::openid_auth_object>();
-    if ( ( result = ASSERT_PASS( ret, "Invalid plugin context.") ).ok() )
-    {
-        if ( ( result = ASSERT_ERROR( _comm != NULL, SYS_INVALID_INPUT_PARAM, "Null rcComm_t pointer." ) ).ok() )
-        {
-            irods::openid_auth_object_ptr ptr = boost::dynamic_pointer_cast<irods::openid_auth_object>(_ctx.fco());
-
+    ret = _ctx.valid<irods::generic_auth_object>();
+    if ( ( result = ASSERT_PASS( ret, "Invalid plugin context.") ).ok() ) {
+        if ( ( result = ASSERT_ERROR( _comm != NULL, SYS_INVALID_INPUT_PARAM, "Null rcComm_t pointer." ) ).ok() ) {
+            irods::generic_auth_object_ptr ptr = boost::dynamic_pointer_cast<irods::generic_auth_object>( _ctx.fco() );
+            
             // set the user name from the conn
             ptr->user_name( _comm->proxyUser.userName );
             
@@ -108,7 +122,7 @@ irods::error openid_auth_client_start(
             //ptr->sock( _comm->sock );
         }
     }
-
+    std::cout << "leaving openid_auth_client_start" << std::endl;
     return result;
 }
 
@@ -117,108 +131,78 @@ irods::error openid_auth_client_start(
 // Sends auth request to server
 irods::error openid_auth_client_request(
     irods::plugin_context& _ctx,
-    rcComm_t*              _comm )
-{
+    rcComm_t*              _comm ) {
+    std::cout << "entering openid_auth_client_request" << std::endl;
     irods::error ret;
     
     // validate incoming parameters
-    if ( !_ctx.valid<irods::openid_auth_object>().ok() )
-    {
+    if ( !_ctx.valid<irods::generic_auth_object>().ok() ) {
         return ERROR( SYS_INVALID_INPUT_PARAM, "Invalid plugin context." );
     }
-    else if ( !_comm )
-    {
+    else if ( !_comm ) {
         return ERROR( SYS_INVALID_INPUT_PARAM, "null comm ptr" );
     }
 
     // get the auth object
-    irods::openid_auth_object_ptr ptr = boost::dynamic_pointer_cast<irods::openid_auth_object>( _ctx.fco() );
+    irods::generic_auth_object_ptr ptr = boost::dynamic_pointer_cast<irods::generic_auth_object>( _ctx.fco() );
 
     // get context string
     std::string context = ptr->context();
-    if ( context.empty() )
-    {
-        return ERROR( SYS_INVALID_INPUT_PARAM, "Empty plugin context string" );
-    }
     
-    // expand the context string
-    irods::kvp_map_t ctx_map;
-    ret = irods::parse_escaped_kvp_string( context, ctx_map );
-    if ( !ret.ok() )
-    {
-        return PASS( ret );
-    }
-    
-    ctx_map[irods::AUTH_USER_KEY] = ptr->user_name();
-    std::string ctx_str = irods::escaped_kvp_string( ctx_map );
+    // set up context string
+    context += irods::kvp_delimiter() + irods::AUTH_USER_KEY + irods::kvp_association() + ptr->user_name(); 
 
-    if ( context.size() > MAX_NAME_LEN )
-    {
-        return ERROR( -1, "context string > max name len" );
+    if ( context.size() > MAX_NAME_LEN ) {
+        return ERROR( SYS_INVALID_INPUT_PARAM, "context string > max name len" );
     }
 
     // copy context to req in
     authPluginReqInp_t req_in;
-    strncpy( req_in.context_, ctx_str.c_str(), ctx_str.size() + 1 );
+    memset( &req_in, 0, sizeof(req_in) );
+    strncpy( req_in.context_, context.c_str(), context.size() + 1 );
     
-    // copy auth scheme to the req in struct
-    // TODO refactor
-    strncpy( req_in.auth_scheme_, "openid", strlen("openid") );
+    // copy auth scheme to the req in struct TODO refactor
+    std::string auth_scheme = "openid";
+    strncpy( req_in.auth_scheme_, auth_scheme.c_str(), auth_scheme.size() + 1 );
 
-    // warm up ssl if not in use (pam does this but not kerberos or gsi)
-    bool using_ssl = ( irods::CS_NEG_USE_SSL == _comm->negotiation_results );
-    if ( !using_ssl )
-    {
-        int err = sslStart( _comm );
-        if ( err )
-        {
-            return ERROR( err, "failed to enable ssl" );
-        }
-    }
-
+    // TODO enable ssl on comm
     authPluginReqOut_t *req_out = 0;
     int status = rcAuthPluginRequest( _comm, &req_in, &req_out );
-
-    // shut down ssl if it was not already in use
-    if ( !using_ssl )
-    {
-        sslEnd( _comm );
-    }
-
+    
     // handle errors and exit
-    if ( status < 0 )
-    {
-        return ERROR( status, "call to rcAuthRequest failed." );
+    if ( status < 0 ) {
+        return ERROR( status, "call to rcAuthPluginRequest failed." );
     }
-    else
-    {
+    else {
         // copy over resulting openid session token
         // and cache the result in our auth object
         ptr->request_result( req_out->result_ );
         obfSavePw( 0, 0, 0, req_out->result_ );
         free( req_out );
+        std::cout << "leaving openid_auth_client_request" << std::endl;
         return SUCCESS();
     }
 }
 
+// Got request from client, send response back from server
 irods::error openid_auth_client_response(
     irods::plugin_context& _ctx,
-    rcComm_t*              _comm )
-{
+    rcComm_t*              _comm ) {
+    std::cout << "entering openid_auth_client_response" << std::endl;
     irods::error result = SUCCESS();
     irods::error ret;
 
     // validate incoming parameters
-    ret = _ctx.valid<irods::openid_auth_object>();
+    ret = _ctx.valid<irods::generic_auth_object>();
     if ( ( result = ASSERT_PASS( ret, "Invalid plugin context." ) ).ok() ) {
         if ( ( result = ASSERT_ERROR( _comm, SYS_INVALID_INPUT_PARAM, "Null comm pointer." ) ).ok() ) {
-
             // =-=-=-=-=-=-=-
             // get the auth object
-            irods::openid_auth_object_ptr ptr = boost::dynamic_pointer_cast<irods::openid_auth_object>( _ctx.fco() );
+            irods::generic_auth_object_ptr ptr = boost::dynamic_pointer_cast<irods::generic_auth_object>( _ctx.fco() );
 
             irods::kvp_map_t kvp;
-            kvp[irods::AUTH_SCHEME_KEY] = "openid"; //TODO refactor
+            std::string auth_scheme_key = "openid";
+            kvp[irods::AUTH_SCHEME_KEY] = auth_scheme_key; //TODO refactor
             std::string resp_str = irods::kvp_string( kvp );
 
             // =-=-=-=-=-=-=-
@@ -236,103 +220,399 @@ irods::error openid_auth_client_response(
             auth_response.response = response;
             auth_response.username = username;
             int status = rcAuthResponse( _comm, &auth_response );
-            result = ASSERT_ERROR( status >= 0, status, "Call to rcAuthResponseFailed." );
+            result = ASSERT_ERROR( status >= 0, status, "Call to rcAuthResponse failed." );
         }
     }
-
+    std::cout << "leaving openid_auth_client_response" << std::endl;
     return result; 
 }
 
 #ifdef RODS_SERVER
-irods::error openid_auth_agent_start(
+/*irods::error openid_establish_context_serverside(
     irods::plugin_context& _ctx,
-    const char*            _inst_name)
-{
+    rsComm_t* comm,
+    char* _clientName,
+    int _maxLen_clientName) {
     irods::error result = SUCCESS();
     irods::error ret;
 
-    ret = _ctx.valid<irods::openid_auth_object>();
-    if ( ( result = ASSERT_PASS( ret, "Invalid plugin context" ) ).ok() )
-    {
-        irods::openid_auth_object_ptr ptr = boost::dynamic_pointer_cast<irods::openid_auth_object>( _ctx.fco() );
-        
-        std::string provider_discovery_url = irods::get_server_property<std::string>("openid_provider_discovery_url");
-        std::string client_id = irods::get_server_property<std::string>("openid_client_id");
-        std::string client_secret = irods::get_server_property<std::string>("openid_client_secret");
-        std::string redirect_uri = irods::get_server_property<std::string>("openid_redirect_uri");
-        std::string authorization_endpoint;
-        std::string token_endpoint;
+    ret = _ctx.valid<irods::generic_auth_object>();
+    if ( ( result = ASSERT_PASS( ret, "Invalid plugin context." ) ).ok() ) {
+        irods::generic_auth_object_ptr ptr = boost::dynamic_pointer_cast<irods::generic_auth_object>( _ctx.fco() );
 
-        if ( !get_provider_metadata_field( provider_discovery_url, "authorization_endpoint", authorization_endpoint )
-            || ! get_provider_metadata_field( provider_discovery_url, "token_endpoint", token_endpoint) )
-        {
-            std::cout << "Provider discovery metadata missing fields" << std::endl;
-            return ERROR(-1, "Provider discovery metadata missing fields");
-        }
+    }
 
-        std::string authorize_url_fmt = "%s?response_type=%s&scope=%s&client_id=%s&redirect_uri=%s";
-        boost::format fmt(authorize_url_fmt);
-        fmt % authorization_endpoint
-            % "code"
-            % "openid"
-            % client_id
-            % redirect_uri; 
-            
-        std::cout << "Waiting for OpenID provider authorization...\n" << authorize_url_fmt << std::endl;
+}*/
 
-        std::string *request_message = accept_request(8080);
-        std::map<std::string,std::string> *param_map = get_params(*request_message);
-        
-        // check for code in callback
-        if ( param_map->find("code") != param_map->end() )
-        {
-            std::string authorization_code = param_map->at("code");
-            std::string *access_token_response = get_access_token(
-                                                token_endpoint,
-                                                authorization_code,
-                                                client_id,
-                                                client_secret,
-                                                redirect_uri);
-            std::cout << *access_token_response << std::endl;
-            std::stringstream response_stream(*access_token_response);
-            boost::property_tree::ptree response_tree;
-            boost::property_tree::read_json(response_stream, response_tree);
-            if (response_tree.find("access_token") == response_tree.not_found()
-                || response_tree.find("id_token") == response_tree.not_found()
-                || response_tree.find("expires_in") == response_tree.not_found())
-            {
-                std::cout << "Token response missing required fields (access_token, expires_in, id_token)" << std::endl;
+irods::error openid_auth_agent_start(
+    irods::plugin_context& _ctx,
+    const char*            _inst_name) {
+    rodsLog( LOG_NOTICE, "entering openid_auth_agent_start");
+    irods::error result = SUCCESS();
+    irods::error ret;
+    ret = _ctx.valid<irods::generic_auth_object>();
+    
+    if ( ( result = ASSERT_PASS( ret, "Invalid plugin context" ) ).ok() ) {
+        irods::generic_auth_object_ptr ptr = boost::dynamic_pointer_cast<irods::generic_auth_object>( _ctx.fco() );
+        int status;
+        //char clientName[500];
+        //genQueryInp_t genQueryInp;
+        //genQueryOut_t *genQueryOut;
+        //char condition1[MAX_NAME_LEN];
+        //char condition2[MAX_NAME_LEN];
+        //char *tResult;
+        int privLevel = 0;
+        int clientPrivLevel = 0;
+        openidAuthReqStatus = 1;
+        status = chkProxyUserPriv( _ctx.comm(), privLevel );
+        if ( ( result = ASSERT_ERROR( status >= 0, status, "Failed checking proxy user priviledges." ) ).ok() ) {
+            //openid_authorize();
+
+            // set comm priv levels
+            _ctx.comm()->proxyUser.authInfo.authFlag = privLevel;
+            _ctx.comm()->clientUser.authInfo.authFlag = clientPrivLevel;
+
+            // Reset the auth scheme here so we do not try to authenticate again unless the client requests it.
+            if ( _ctx.comm()->auth_scheme != NULL ) {
+                free( _ctx.comm()->auth_scheme );
             }
-            else
-            {
-                std::string id_token = response_tree.get<std::string>("id_token");
-                std::string access_token = response_tree.get<std::string>("access_token");
-                std::string expires_in = response_tree.get<std::string>("expires_in");
-                std::cout << "id_token: " << id_token << std::endl;
-                // TODO base64 decode and validate fields 
-                // https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation
-                std::cout << "access_token: " << access_token << std::endl;
-                std::cout << "expires_in: " << expires_in << std::endl;
-            }
-            delete access_token_response;
+            _ctx.comm()->auth_scheme = NULL;        
+        }
+    }
+    rodsLog( LOG_NOTICE, "leaving openid_auth_agent_start");
+    return result;
+}
 
+
+irods::error openid_authorize() {
+    //irods::generic_auth_object_ptr ptr = boost::dynamic_pointer_cast<irods::generic_auth_object>( _ctx.fco() );
+        
+    std::string provider_discovery_url = irods::get_server_property<std::string>("openid_provider_discovery_url");
+    std::string client_id = irods::get_server_property<std::string>("openid_client_id");
+    std::string client_secret = irods::get_server_property<std::string>("openid_client_secret");
+    std::string redirect_uri = irods::get_server_property<std::string>("openid_redirect_uri");
+    std::string authorization_endpoint;
+    std::string token_endpoint;
+
+    if ( !get_provider_metadata_field( provider_discovery_url, "authorization_endpoint", authorization_endpoint )
+         || ! get_provider_metadata_field( provider_discovery_url, "token_endpoint", token_endpoint) ) {
+        std::cout << "Provider discovery metadata missing fields" << std::endl;
+        return ERROR(-1, "Provider discovery metadata missing fields");
+    }
+
+    std::string authorize_url_fmt = "%s?response_type=%s&scope=%s&client_id=%s&redirect_uri=%s";
+    boost::format fmt(authorize_url_fmt);
+    fmt % authorization_endpoint
+        % "code"
+        % "openid"
+        % client_id
+        % redirect_uri; 
+        
+    std::cout << "Waiting for OpenID provider authorization...\n" << authorize_url_fmt << std::endl;
+
+    std::string *request_message = accept_request(8080);
+    std::map<std::string,std::string> *param_map = get_params(*request_message);
+
+    // check for code in callback
+    if ( param_map->find("code") != param_map->end() ) {
+        std::string authorization_code = param_map->at("code");
+        std::string *access_token_response = get_access_token(
+                                            token_endpoint,
+                                            authorization_code,
+                                            client_id,
+                                            client_secret,
+                                            redirect_uri);
+        std::cout << *access_token_response << std::endl;
+        std::stringstream response_stream(*access_token_response);
+        boost::property_tree::ptree response_tree;
+        boost::property_tree::read_json(response_stream, response_tree);
+        if (response_tree.find("access_token") == response_tree.not_found()
+            || response_tree.find("id_token") == response_tree.not_found()
+            || response_tree.find("expires_in") == response_tree.not_found()) {
+            std::cout << "Token response missing required fields (access_token, expires_in, id_token)" << std::endl;
         }
-        else
-        {
-            return ERROR(-1, "Redirect callback missing required params");
+        else {
+            std::string id_token = response_tree.get<std::string>("id_token");
+            std::string access_token = response_tree.get<std::string>("access_token");
+            std::string expires_in = response_tree.get<std::string>("expires_in");
+            std::cout << "id_token: " << id_token << std::endl;
+            // TODO base64 decode and validate fields 
+            // https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation
+            std::cout << "access_token: " << access_token << std::endl;
+            std::cout << "expires_in: " << expires_in << std::endl;
         }
-    } // end plugin context check
+        delete access_token_response;
+    }
+    else {
+        return ERROR(-1, "Redirect callback missing required params");
+    }
+    std::cout << "leaving openid_authorize" << std::endl;
     return SUCCESS();
 }
 
+
+static irods::error _get_server_property(std::string key, std::string& buf) {
+    try {
+        buf = irods::get_server_property<std::string&>(key);
+    }
+    catch ( const irods::exception& e) {
+        return irods::error(e);
+    }
+    return SUCCESS();
+}
+
+// server receives request from client
 irods::error openid_auth_agent_request(
     irods::plugin_context& _ctx ) {
+    std::cout << "entering openid_auth_agent_request" << std::endl;
+    
+    irods::error result = SUCCESS();
+    irods::error ret;
+
+    // validate incoming parameters
+    ret = _ctx.valid<irods::generic_auth_object>();
+    if ( ( result = ASSERT_PASS( ret, "Invalid plugin context." ) ).ok() ) {
+
+        if ( openidAuthReqStatus == 1 ) {
+            openidAuthReqStatus = 0;
+            if ( !( result = ASSERT_ERROR( openidAuthReqError == 0, openidAuthReqError,
+                                           "An openid auth request error has occurred." ) ).ok() ) {
+                rodsLogAndErrorMsg( LOG_NOTICE, &_ctx.comm()->rError, openidAuthReqError,
+                                    openidAuthReqErrorMsg );
+            }
+        }
+
+        if ( result.ok() ) {
+            irods::generic_auth_object_ptr ptr = boost::dynamic_pointer_cast<irods::generic_auth_object>( _ctx.fco() );
+            std::string metadata_url;
+            ret = _get_server_property("openid_provider_discovery_url", metadata_url);
+            ret = SUCCESS();
+            //ret = krb_kerberos_name(kerberos_name);
+            if ( ( result = ASSERT_PASS( ret, "Failed to get openid provider discovery url from server config." ) ).ok() ) {
+                std::string service_name;
+                //ret = krb_setup_creds( ptr, false, kerberos_name, service_name );
+                if ( ( result = ASSERT_PASS( ret, "Setting up openid credentials failed." ) ).ok() ) {
+                    //_ctx.comm()->gsiRequest = 1;
+                    if ( _ctx.comm()->auth_scheme != NULL ) {
+                        free( _ctx.comm()->auth_scheme );
+                    }
+                    _ctx.comm()->auth_scheme = strdup( AUTH_OPENID_SCHEME.c_str() );
+                    //ptr->service_name( service_name );
+                    ptr->request_result( service_name );
+                }
+            }
+        }
+    }
+    
+    std::cout << "leaving openid_auth_agent_request" << std::endl;
     return SUCCESS();
+}
+
+static irods::error check_proxy_user_privileges(
+    rsComm_t *rsComm,
+    int proxyUserPriv ) {
+    irods::error result = SUCCESS();
+
+    if ( strcmp( rsComm->proxyUser.userName, rsComm->clientUser.userName ) != 0 ) {
+
+        /* remote privileged user can only do things on behalf of users from
+         * the same zone */
+        result = ASSERT_ERROR( proxyUserPriv >= LOCAL_PRIV_USER_AUTH ||
+                               ( proxyUserPriv >= REMOTE_PRIV_USER_AUTH &&
+                                 strcmp( rsComm->proxyUser.rodsZone, rsComm->clientUser.rodsZone ) == 0 ),
+                               SYS_PROXYUSER_NO_PRIV,
+                               "Proxyuser: \"%s\" with %d no priv to auth clientUser: \"%s\".",
+                               rsComm->proxyUser.userName, proxyUserPriv, rsComm->clientUser.userName );
+    }
+    return result;
 }
 
 irods::error openid_auth_agent_response(
     irods::plugin_context& _ctx,
     authResponseInp_t*     _resp ) {
+    std::cout << "entering openid_auth_agent_response" << std::endl;
+    irods::error result = SUCCESS();
+    irods::error ret;
+
+    // validate incoming parameters
+    ret = _ctx.valid<irods::openid_auth_object>();
+    if ( ( result = ASSERT_PASS( ret, "Invalid plugin context." ) ).ok() ) {
+        int status;
+        char *bufp;
+        authCheckInp_t authCheckInp;
+        authCheckOut_t *authCheckOut = NULL;
+        rodsServerHost_t *rodsServerHost;
+
+        char digest[RESPONSE_LEN + 2];
+        char md5Buf[CHALLENGE_LEN + MAX_PASSWORD_LEN + 2];
+        char serverId[MAX_PASSWORD_LEN + 2];
+        MD5_CTX context;
+
+        bufp = _rsAuthRequestGetChallenge();
+
+        /* need to do NoLogin because it could get into inf loop for cross
+         * zone auth */
+
+        status = getAndConnRcatHostNoLogin( _ctx.comm(), MASTER_RCAT,
+                                            _ctx.comm()->proxyUser.rodsZone, &rodsServerHost );
+        if ( ( result = ASSERT_ERROR( status >= 0, status, "Connecting to rcat host failed." ) ).ok() ) {
+            memset( &authCheckInp, 0, sizeof( authCheckInp ) );
+            authCheckInp.challenge = bufp;
+            authCheckInp.response = _resp->response;
+            authCheckInp.username = _resp->username;
+
+            if ( rodsServerHost->localFlag == LOCAL_HOST ) {
+                status = rsAuthCheck( _ctx.comm(), &authCheckInp, &authCheckOut );
+            }
+            else {
+                status = rcAuthCheck( rodsServerHost->conn, &authCheckInp, &authCheckOut );
+                /* not likely we need this connection again */
+                rcDisconnect( rodsServerHost->conn );
+                rodsServerHost->conn = NULL;
+            }
+            if ( ( result = ASSERT_ERROR( status >= 0 && authCheckOut != NULL, status, "rcAuthCheck failed, status = %d.",
+                                          status ) ).ok() ) { // JMC cppcheck
+
+                if ( rodsServerHost->localFlag != LOCAL_HOST ) {
+                    if ( authCheckOut->serverResponse == NULL ) {
+                        rodsLog( LOG_NOTICE, "Warning, cannot authenticate remote server, no serverResponse field" );
+                        result = ASSERT_ERROR( !requireServerAuth, REMOTE_SERVER_AUTH_NOT_PROVIDED, "Authentication disallowed. no serverResponse field." );
+                    }
+
+                    else {
+                        char *cp;
+                        int OK, len, i;
+                        if ( *authCheckOut->serverResponse == '\0' ) {
+                            rodsLog( LOG_NOTICE, "Warning, cannot authenticate remote server, serverResponse field is empty" );
+                            result = ASSERT_ERROR( !requireServerAuth, REMOTE_SERVER_AUTH_EMPTY, "Authentication disallowed, empty serverResponse." );
+                        }
+                        else {
+                            char username2[NAME_LEN + 2];
+                            char userZone[NAME_LEN + 2];
+                            memset( md5Buf, 0, sizeof( md5Buf ) );
+                            strncpy( md5Buf, authCheckInp.challenge, CHALLENGE_LEN );
+                            parseUserName( _resp->username, username2, userZone );
+                            getZoneServerId( userZone, serverId );
+                            len = strlen( serverId );
+                            if ( len <= 0 ) {
+                                rodsLog( LOG_NOTICE, "rsAuthResponse: Warning, cannot authenticate the remote server, no RemoteZoneSID defined in server.config", status );
+                                result = ASSERT_ERROR( !requireServerAuth, REMOTE_SERVER_SID_NOT_DEFINED, "Authentication disallowed, no RemoteZoneSID defined." );
+                            }
+                            else {
+                                strncpy( md5Buf + CHALLENGE_LEN, serverId, len );
+                                MD5_Init( &context );
+                                MD5_Update( &context, ( unsigned char* )md5Buf, CHALLENGE_LEN + MAX_PASSWORD_LEN );
+                                MD5_Final( ( unsigned char* )digest, &context );
+                                for ( i = 0; i < RESPONSE_LEN; i++ ) {
+                                    if ( digest[i] == '\0' ) {
+                                        digest[i]++;
+                                    }  /* make sure 'string' doesn't
+                                          end early*/
+                                }
+                                cp = authCheckOut->serverResponse;
+                                OK = 1;
+                                for ( i = 0; i < RESPONSE_LEN; i++ ) {
+                                    if ( *cp++ != digest[i] ) {
+                                        OK = 0;
+                                    }
+                                }
+                                rodsLog( LOG_DEBUG, "serverResponse is OK/Not: %d", OK );
+                                result = ASSERT_ERROR( OK != 0, REMOTE_SERVER_AUTHENTICATION_FAILURE, "Authentication disallowed, server response incorrect." );
+                            }
+                        }
+                    }
+                }
+
+                /* Set the clientUser zone if it is null. */
+                if ( result.ok() && strlen( _ctx.comm()->clientUser.rodsZone ) == 0 ) {
+                    zoneInfo_t *tmpZoneInfo;
+                    status = getLocalZoneInfo( &tmpZoneInfo );
+                    if ( ( result = ASSERT_ERROR( status >= 0, status, "getLocalZoneInfo failed." ) ).ok() ) {
+                        strncpy( _ctx.comm()->clientUser.rodsZone, tmpZoneInfo->zoneName, NAME_LEN );
+                    }
+                }
+
+                /* have to modify privLevel if the icat is a foreign icat because
+                 * a local user in a foreign zone is not a local user in this zone
+                 * and vice versa for a remote user
+                 */
+                if ( result.ok() && rodsServerHost->rcatEnabled == REMOTE_ICAT ) {
+
+                    /* proxy is easy because rodsServerHost is based on proxy user */
+                    if ( authCheckOut->privLevel == LOCAL_PRIV_USER_AUTH ) {
+                        authCheckOut->privLevel = REMOTE_PRIV_USER_AUTH;
+                    }
+                    else if ( authCheckOut->privLevel == LOCAL_USER_AUTH ) {
+                        authCheckOut->privLevel = REMOTE_USER_AUTH;
+                    }
+
+                    /* adjust client user */
+                    if ( strcmp( _ctx.comm()->proxyUser.userName,  _ctx.comm()->clientUser.userName ) == 0 ) {
+                        authCheckOut->clientPrivLevel = authCheckOut->privLevel;
+                    }
+                    else {
+                        zoneInfo_t *tmpZoneInfo;
+                        status = getLocalZoneInfo( &tmpZoneInfo );
+                        if ( ( result = ASSERT_ERROR( status >= 0, status, "getLocalZoneInfo failed." ) ).ok() ) {
+                            if ( strcmp( tmpZoneInfo->zoneName,  _ctx.comm()->clientUser.rodsZone ) == 0 ) {
+                                /* client is from local zone */
+                                if ( authCheckOut->clientPrivLevel == REMOTE_PRIV_USER_AUTH ) {
+                                    authCheckOut->clientPrivLevel = LOCAL_PRIV_USER_AUTH;
+                                }
+                                else if ( authCheckOut->clientPrivLevel == REMOTE_USER_AUTH ) {
+                                    authCheckOut->clientPrivLevel = LOCAL_USER_AUTH;
+                                }
+                            }
+                            else {
+                                /* client is from remote zone */
+                                if ( authCheckOut->clientPrivLevel == LOCAL_PRIV_USER_AUTH ) {
+                                    authCheckOut->clientPrivLevel = REMOTE_USER_AUTH;
+                                }
+                                else if ( authCheckOut->clientPrivLevel == LOCAL_USER_AUTH ) {
+                                    authCheckOut->clientPrivLevel = REMOTE_USER_AUTH;
+                                }
+                            }
+                        }
+                    }
+                }
+                else if ( strcmp( _ctx.comm()->proxyUser.userName,  _ctx.comm()->clientUser.userName ) == 0 ) {
+                    authCheckOut->clientPrivLevel = authCheckOut->privLevel;
+                }
+
+                if ( result.ok() ) {
+                    ret = check_proxy_user_privileges( _ctx.comm(), authCheckOut->privLevel );
+
+                    if ( ( result = ASSERT_PASS( ret, "Check proxy user priviledges failed." ) ).ok() ) {
+                        rodsLog( LOG_DEBUG,
+                                 "rsAuthResponse set proxy authFlag to %d, client authFlag to %d, user:%s proxy:%s client:%s",
+                                 authCheckOut->privLevel,
+                                 authCheckOut->clientPrivLevel,
+                                 authCheckInp.username,
+                                 _ctx.comm()->proxyUser.userName,
+                                 _ctx.comm()->clientUser.userName );
+
+                        if ( strcmp( _ctx.comm()->proxyUser.userName,  _ctx.comm()->clientUser.userName ) != 0 ) {
+                            _ctx.comm()->proxyUser.authInfo.authFlag = authCheckOut->privLevel;
+                            _ctx.comm()->clientUser.authInfo.authFlag = authCheckOut->clientPrivLevel;
+                        }
+                        else {          /* proxyUser and clientUser are the same */
+                            _ctx.comm()->proxyUser.authInfo.authFlag =
+                                _ctx.comm()->clientUser.authInfo.authFlag = authCheckOut->privLevel;
+                        }
+
+                    }
+                }
+            }
+        }
+        if ( authCheckOut != NULL ) {
+            if ( authCheckOut->serverResponse != NULL ) {
+                free( authCheckOut->serverResponse );
+            }
+
+            free( authCheckOut );
+        }
+    }
+    std::cout << "leaving openid_auth_agent_response" << std::endl;
     return SUCCESS();
 }
 
@@ -341,6 +621,9 @@ irods::error openid_auth_agent_verify(
     const char*            _challenge,
     const char*            _user_name,
     const char*            _response ) {
+    std::cout << "entering openid_auth_agent_verify" << std::endl;
+
+    std::cout << "leaving openid_auth_agent_verify" << std::endl;
     return SUCCESS();
 }
 #endif
@@ -718,10 +1001,10 @@ int main(int argc, char **argv)
             std::string authorization_code = param_map->at("code");
             //cout << "Using authorization code to retrieve OAuth2 access token" << endl;
             std::string *access_token_response = get_access_token(
-                                                "https://www.googleapis.com/oauth2/v4/token",
+                                                provider_token_endpoint,
                                                 authorization_code,
-                                                "118582272506-6vm4rruieahekajob0tghgdf3iogtdgt.apps.googleusercontent.com",
-                                                "el7Fkt1q4KMozJ-M9uNJebWz",
+                                                client_id,
+                                                client_secret,
                                                 "http://localhost:8080");
 
             std::cout << *access_token_response;
