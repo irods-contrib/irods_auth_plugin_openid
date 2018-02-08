@@ -36,6 +36,7 @@
 //#include <iostream>
 #include <sstream>
 #include <map>
+#include <thread>
 #include <regex>
 #include <unistd.h>
 #include <fcntl.h>
@@ -56,11 +57,11 @@
 // Set requireServerAuth to 1 to fail authentications from
 // un-authenticated Servers (for example, if the LocalZoneSID
 // is not set)
-static const int requireServerAuth = 0;
+//static const int requireServerAuth = 0;
 static int openidAuthReqStatus = 0;
-static int openidAuthReqError = 0;
-static const int openidAuthErrorSize = 1000;
-static char openidAuthReqErrorMsg[openidAuthErrorSize];
+//static int openidAuthReqError = 0;
+//static const int openidAuthErrorSize = 1000;
+//static char openidAuthReqErrorMsg[openidAuthErrorSize];
 #endif
 
 static const std::string AUTH_OPENID_SCHEME("openid");
@@ -78,11 +79,99 @@ std::string *get_access_token(std::string token_endpoint_url,
                          std::string client_secret,
                          std::string redirect_uri);
 
-boost::property_tree::ptree *get_provider_metadata(std::string provider_metadata_url);
 bool get_provider_metadata_field(std::string provider_metadata_url, const std::string fieldname, std::string& value);
-
+irods::error generate_authorization_url(std::string& urlBuf);
 irods::error openid_authorize();
 ///END DECLARATIONS
+
+#define OPENID_COMM_PORT 1357
+
+void read_from_server(std::string* buf_out) {
+    std::cout << "entering read_from_server" << std::endl;
+    int sockfd, n_bytes;
+    struct sockaddr_in serv_addr;
+    struct hostent* server;
+    const int READ_LEN = 256;
+    char buffer[READ_LEN + 1];
+    memset( buffer, 0, READ_LEN + 1 );
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if ( sockfd < 0 ) {
+        perror( "socket" );
+        return;
+    }
+    server = gethostbyname( "localhost" );
+    if ( server == NULL ) {
+        fprintf( stderr, "No host found for localhost"); 
+        return;
+    }
+    memset( &serv_addr, 0, sizeof( serv_addr ) );
+    serv_addr.sin_family = AF_INET;
+    memcpy( server->h_addr, &serv_addr.sin_addr.s_addr, server->h_length );
+    serv_addr.sin_port = htons( OPENID_COMM_PORT );
+    if ( connect( sockfd, (struct sockaddr*)&serv_addr, sizeof( serv_addr ) ) < 0 ) {
+        perror( "connect" );
+        return;
+    }
+    // read first 4 bytes (data length)
+    int data_len = 0;
+    read( sockfd, &data_len, sizeof( data_len ) );
+    // read that many bytes into our buffer
+    int total_bytes = 0;
+    while ( total_bytes < data_len ) {
+        n_bytes = read( sockfd, buffer, READ_LEN );
+        if ( n_bytes == -1 ) {
+            // error reading
+            break;
+        }
+        if ( n_bytes == 0 ) {
+            // no more data
+            break;
+        }
+        std::cout << "received " << n_bytes << " bytes: " << buffer << std::endl;
+        buf_out->append( buffer );
+        total_bytes += n_bytes;
+        memset( buffer, 0, READ_LEN );
+    }
+    
+    std::cout << "leaving read_from_server" << std::endl;
+}
+
+void wait_for_socket_data(int* sockp, std::string* buf) {
+    std::cout << "entering wait_for_socket_data" << std::endl;
+    int sockfd = *sockp;
+    char byte_buf[256];
+    memset( byte_buf, 0, 256 );
+    long n_bytes;
+    //struct sockaddr_in client_addr;
+    //memset( &client_addr, 0, sizeof( client_addr ) );
+    //socklen_t client_addr_len = sizeof( client_addr );
+    //listen( sockfd, 1 );
+    //int conn_fd = accept( sockfd, (struct sockaddr*) &client_addr, &client_addr_len );
+    struct timeval timeout;
+    timeout.tv_sec = 30; // 30 sec timeout
+    timeout.tv_usec = 0;
+    setsockopt( sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout) );
+    int data_len = 0; 
+    n_bytes = recv( sockfd, &data_len, sizeof(data_len), 0 /*MSG_PEEK*/ );
+    //data_len = ntohl(data_len);
+
+    std::cout << "socket data length: " << data_len << std::endl;
+    int total_bytes = 0;
+    while ( total_bytes < data_len ) {
+        n_bytes = recv( sockfd, byte_buf, 256, 0);
+        if ( n_bytes == -1 ) break;
+        if ( n_bytes == 0 ) {
+            //close( conn_fd );
+            break;
+        }
+        std::cout << "received bytes: " << byte_buf << std::endl;
+        buf->append( byte_buf );
+        total_bytes += n_bytes;
+        memset( byte_buf, 0, 256 );
+    }
+    std::cout << "leaving wait_for_socket_data" << std::endl;
+}
+
 
 irods::error openid_auth_establish_context(
     irods::plugin_context& _ctx ) {
@@ -94,6 +183,13 @@ irods::error openid_auth_establish_context(
     if ( !ret.ok()) {
         return ERROR(SYS_INVALID_INPUT_PARAM, "Invalid plugin context.");
     }
+    irods::generic_auth_object_ptr ptr = boost::dynamic_pointer_cast<irods::generic_auth_object>( _ctx.fco() );
+    // wait for message from server
+    //int sockfd = ptr->sock();
+    //std::string message;
+    //std::thread url_thread( wait_for_socket_data, &sockfd, &message );
+    //std::cout << "got message from server: " << message << std::endl;
+    //url_thread.join();
     std::cout << "leaving openid_auth_establish_context" << std::endl;
     return ret;
 }
@@ -119,7 +215,20 @@ irods::error openid_auth_client_start(
             ptr->zone_name( _comm->proxyUser.rodsZone );
 
             // set the socket from the conn
-            //ptr->sock( _comm->sock );
+            ptr->sock( _comm->sock );
+            char pwBuf[MAX_PASSWORD_LEN + 1];
+            memset( pwBuf, 0, MAX_PASSWORD_LEN + 1);
+            int getPwError = obfGetPw( pwBuf );
+            if ( getPwError || strlen( (const char*)pwBuf ) == 0 ) {
+                std::cout << "No cached password file" << std::endl;
+            }
+            else {
+                std::cout << "Password file contains: " << pwBuf << std::endl;
+            }
+            std::string auth_url;
+            //int sockfd = _comm->sock;
+            //wait_for_socket_data( &sockfd, &auth_url );
+            //std::cout << "Client got url: " << auth_url << std::endl;
         }
     }
     std::cout << "leaving openid_auth_client_start" << std::endl;
@@ -127,8 +236,7 @@ irods::error openid_auth_client_start(
 }
 
 
-// Auth request call on client side
-// Sends auth request to server
+// Sends auth request from client to server
 irods::error openid_auth_client_request(
     irods::plugin_context& _ctx,
     rcComm_t*              _comm ) {
@@ -148,7 +256,7 @@ irods::error openid_auth_client_request(
 
     // get context string
     std::string context = ptr->context();
-    
+
     // set up context string
     context += irods::kvp_delimiter() + irods::AUTH_USER_KEY + irods::kvp_association() + ptr->user_name(); 
 
@@ -160,15 +268,22 @@ irods::error openid_auth_client_request(
     authPluginReqInp_t req_in;
     memset( &req_in, 0, sizeof(req_in) );
     strncpy( req_in.context_, context.c_str(), context.size() + 1 );
-    
+
     // copy auth scheme to the req in struct TODO refactor
-    std::string auth_scheme = "openid";
+    std::string auth_scheme = AUTH_OPENID_SCHEME;
     strncpy( req_in.auth_scheme_, auth_scheme.c_str(), auth_scheme.size() + 1 );
 
     // TODO enable ssl on comm
+    // call plugin request to server in thread
     authPluginReqOut_t *req_out = 0;
+    std::cout << "calling rcAuthPluginRequest" << std::endl;
     int status = rcAuthPluginRequest( _comm, &req_in, &req_out );
     
+    // get authorization url from server
+    std::string authorization_url;
+    read_from_server( &authorization_url );
+    std::cout << "read from server: " << authorization_url << std::endl;
+
     // handle errors and exit
     if ( status < 0 ) {
         return ERROR( status, "call to rcAuthPluginRequest failed." );
@@ -176,15 +291,20 @@ irods::error openid_auth_client_request(
     else {
         // copy over resulting openid session token
         // and cache the result in our auth object
-        ptr->request_result( req_out->result_ );
-        obfSavePw( 0, 0, 0, req_out->result_ );
+        // blocking wait for openid token from server
+        //std::string access_token;
+        //wait_for_socket_data( &sock, &access_token );
+        //std::cout << "OpenID Access Token: \n" << access_token << std::endl;
+
+        //ptr->request_result( access_token.c_str() );
+        //obfSavePw( 0, 0, 0, access_token.c_str() );
         free( req_out );
         std::cout << "leaving openid_auth_client_request" << std::endl;
         return SUCCESS();
     }
 }
 
-// Got request from client, send response back from server
+// Got request response from server, send response (ack) back to server
 irods::error openid_auth_client_response(
     irods::plugin_context& _ctx,
     rcComm_t*              _comm ) {
@@ -201,7 +321,7 @@ irods::error openid_auth_client_response(
             irods::generic_auth_object_ptr ptr = boost::dynamic_pointer_cast<irods::generic_auth_object>( _ctx.fco() );
 
             irods::kvp_map_t kvp;
-            std::string auth_scheme_key = "openid";
+            std::string auth_scheme_key = AUTH_OPENID_SCHEME;
             kvp[irods::AUTH_SCHEME_KEY] = auth_scheme_key; //TODO refactor
             std::string resp_str = irods::kvp_string( kvp );
 
@@ -228,7 +348,8 @@ irods::error openid_auth_client_response(
 }
 
 #ifdef RODS_SERVER
-/*irods::error openid_establish_context_serverside(
+/*
+irods::error openid_establish_context_serverside(
     irods::plugin_context& _ctx,
     rsComm_t* comm,
     char* _clientName,
@@ -239,10 +360,62 @@ irods::error openid_auth_client_response(
     ret = _ctx.valid<irods::generic_auth_object>();
     if ( ( result = ASSERT_PASS( ret, "Invalid plugin context." ) ).ok() ) {
         irods::generic_auth_object_ptr ptr = boost::dynamic_pointer_cast<irods::generic_auth_object>( _ctx.fco() );
+        int sockfd = comm->sock;
+        std::string msg("This is a message");
+        write( sockfd, msg.size(), sizeof(int) );
+        write( sockfd, msg.c_str(), msg.size() );
 
     }
 
-}*/
+}
+*/
+static irods::error _get_server_property(std::string key, std::string& buf) {
+    try {
+        buf = irods::get_server_property<std::string&>(key);
+    }
+    catch ( const irods::exception& e) {
+        return irods::error(e);
+    }
+    return SUCCESS();
+}
+
+
+irods::error openid_establish_context_serverside(
+    irods::plugin_context& _ctx) {
+    irods::error result = SUCCESS();
+    irods::error ret;
+
+    if ( ( result = ASSERT_PASS( ret, "Invalid plugin context" ) ).ok() ) {
+        irods::generic_auth_object_ptr ptr = boost::dynamic_pointer_cast<irods::generic_auth_object>( _ctx.fco() );
+        //int sockfd = ptr->sock();
+        int sockfd = _ctx.comm()->sock;
+        std::string authorization_url;
+        ret = generate_authorization_url(authorization_url);
+        if ( !ret.ok() ) {
+            return ERROR(-1, "Could not generate authorization url");
+        }
+        std::cout << "Writing '" << authorization_url << "' to socket" << std::endl;
+        // write authorization url to socket
+        int write_len = authorization_url.size();
+        write( sockfd, &write_len, 4 );
+        write( sockfd, authorization_url.c_str(), authorization_url.size() );
+
+        if ( _ctx.comm()->auth_scheme != NULL ) {
+            free( _ctx.comm()->auth_scheme );
+        }
+        _ctx.comm()->auth_scheme = strdup( AUTH_OPENID_SCHEME.c_str() );
+        
+
+
+        // listen for authorization callback
+
+        //openid_authorize();
+
+        // set request result to the authorization url
+        //ptr->request_result( authorization_url );
+    }
+    return result;
+}
 
 irods::error openid_auth_agent_start(
     irods::plugin_context& _ctx,
@@ -254,29 +427,33 @@ irods::error openid_auth_agent_start(
     
     if ( ( result = ASSERT_PASS( ret, "Invalid plugin context" ) ).ok() ) {
         irods::generic_auth_object_ptr ptr = boost::dynamic_pointer_cast<irods::generic_auth_object>( _ctx.fco() );
-        int status;
+        int status = 0;
         //char clientName[500];
         //genQueryInp_t genQueryInp;
         //genQueryOut_t *genQueryOut;
         //char condition1[MAX_NAME_LEN];
         //char condition2[MAX_NAME_LEN];
         //char *tResult;
-        int privLevel = 0;
-        int clientPrivLevel = 0;
+        
+        //int privLevel = 0;
+        //int clientPrivLevel = 0;
         openidAuthReqStatus = 1;
-        status = chkProxyUserPriv( _ctx.comm(), privLevel );
+        
+        openid_establish_context_serverside( _ctx );
+        
+        //status = chkProxyUserPriv( _ctx.comm(), privLevel );
         if ( ( result = ASSERT_ERROR( status >= 0, status, "Failed checking proxy user priviledges." ) ).ok() ) {
             //openid_authorize();
 
             // set comm priv levels
-            _ctx.comm()->proxyUser.authInfo.authFlag = privLevel;
-            _ctx.comm()->clientUser.authInfo.authFlag = clientPrivLevel;
+            //_ctx.comm()->proxyUser.authInfo.authFlag = privLevel;
+            //_ctx.comm()->clientUser.authInfo.authFlag = clientPrivLevel;
 
             // Reset the auth scheme here so we do not try to authenticate again unless the client requests it.
             if ( _ctx.comm()->auth_scheme != NULL ) {
                 free( _ctx.comm()->auth_scheme );
             }
-            _ctx.comm()->auth_scheme = NULL;        
+            _ctx.comm()->auth_scheme = strdup( AUTH_OPENID_SCHEME.c_str() ); 
         }
     }
     rodsLog( LOG_NOTICE, "leaving openid_auth_agent_start");
@@ -284,13 +461,23 @@ irods::error openid_auth_agent_start(
 }
 
 
-irods::error openid_authorize() {
-    //irods::generic_auth_object_ptr ptr = boost::dynamic_pointer_cast<irods::generic_auth_object>( _ctx.fco() );
-        
-    std::string provider_discovery_url = irods::get_server_property<std::string>("openid_provider_discovery_url");
-    std::string client_id = irods::get_server_property<std::string>("openid_client_id");
-    std::string client_secret = irods::get_server_property<std::string>("openid_client_secret");
-    std::string redirect_uri = irods::get_server_property<std::string>("openid_redirect_uri");
+irods::error generate_authorization_url(std::string& urlBuf) {    
+    irods::error ret;
+    std::string provider_discovery_url;
+    ret = _get_server_property("openid_provider_discovery_url", provider_discovery_url);
+    if ( !ret.ok() ) {
+        return ret;
+    }
+    std::string client_id;
+    ret = _get_server_property("openid_client_id", client_id);
+    if ( !ret.ok() ) {
+        return ret;
+    }
+    std::string redirect_uri;
+    ret = _get_server_property("openid_redirect_uri", redirect_uri);
+    if ( !ret.ok() ) {
+        return ret;
+    }
     std::string authorization_endpoint;
     std::string token_endpoint;
 
@@ -308,10 +495,25 @@ irods::error openid_authorize() {
         % client_id
         % redirect_uri; 
         
-    std::cout << "Waiting for OpenID provider authorization...\n" << authorize_url_fmt << std::endl;
+    //std::cout << "Waiting for OpenID provider authorization...\n" << fmt.str() << std::endl;
+    urlBuf = fmt.str();
+    return SUCCESS();
+}
 
+
+irods::error openid_authorize() {
+    std::string provider_discovery_url = irods::get_server_property<std::string>("openid_provider_discovery_url");
+    std::string client_id = irods::get_server_property<std::string>("openid_client_id");
+    std::string client_secret = irods::get_server_property<std::string>("openid_client_secret");
+    std::string redirect_uri = irods::get_server_property<std::string>("openid_redirect_uri");
+    std::string token_endpoint;
     std::string *request_message = accept_request(8080);
     std::map<std::string,std::string> *param_map = get_params(*request_message);
+    
+    if ( !get_provider_metadata_field( provider_discovery_url, "token_endpoint", token_endpoint) ) {
+        std::cout << "Provider discovery metadata missing fields" << std::endl;
+        return ERROR(-1, "Provider discovery metadata missing fields");
+    }
 
     // check for code in callback
     if ( param_map->find("code") != param_map->end() ) {
@@ -350,64 +552,70 @@ irods::error openid_authorize() {
     return SUCCESS();
 }
 
+std::thread* write_thread = NULL;
+void open_write_to_port(int portno, std::string msg) {
+    int sockfd, conn_sockfd;
+    socklen_t clilen;
+    struct sockaddr_in serv_addr, cli_addr;
+    sockfd = socket( AF_INET, SOCK_STREAM, 0 );
+    if ( sockfd < 0 ) {
+        perror( "socket" );
+        return;
+    }
+    memset( &serv_addr, 0, sizeof( serv_addr ) );
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_addr.s_addr = INADDR_ANY;
+    serv_addr.sin_port = htons( portno );
+    if ( bind( sockfd, (struct sockaddr*) &serv_addr, sizeof( serv_addr ) ) < 0 ) {
+        perror( "bind" );
+        return;
+    }
+    listen( sockfd, 1 );
+    clilen = sizeof( cli_addr );
+    conn_sockfd = accept( sockfd, (struct sockaddr*) &cli_addr, &clilen );
+    if ( conn_sockfd < 0 ) {
+        perror( "accept" );
+        return;
+    }
+    int msg_len = msg.size();
+    write( conn_sockfd, &msg_len, sizeof( msg_len ) );
+    write( conn_sockfd, msg.c_str(), msg_len );
+    close( conn_sockfd );
+    close( sockfd );
 
-static irods::error _get_server_property(std::string key, std::string& buf) {
-    try {
-        buf = irods::get_server_property<std::string&>(key);
-    }
-    catch ( const irods::exception& e) {
-        return irods::error(e);
-    }
-    return SUCCESS();
+    // done writing, reset thread pointer;
+    write_thread = NULL;
 }
 
-// server receives request from client
+// server receives request from client 
+// called from rsAuthAgentRequest, which is called by rcAuthAgentRequest
 irods::error openid_auth_agent_request(
     irods::plugin_context& _ctx ) {
-    std::cout << "entering openid_auth_agent_request" << std::endl;
-    
+    rodsLog( LOG_NOTICE, "entering openid_auth_agent_request");
     irods::error result = SUCCESS();
     irods::error ret;
 
     // validate incoming parameters
     ret = _ctx.valid<irods::generic_auth_object>();
     if ( ( result = ASSERT_PASS( ret, "Invalid plugin context." ) ).ok() ) {
-
-        if ( openidAuthReqStatus == 1 ) {
-            openidAuthReqStatus = 0;
-            if ( !( result = ASSERT_ERROR( openidAuthReqError == 0, openidAuthReqError,
-                                           "An openid auth request error has occurred." ) ).ok() ) {
-                rodsLogAndErrorMsg( LOG_NOTICE, &_ctx.comm()->rError, openidAuthReqError,
-                                    openidAuthReqErrorMsg );
-            }
+        irods::generic_auth_object_ptr ptr = boost::dynamic_pointer_cast<irods::generic_auth_object>( _ctx.fco() );
+        if ( _ctx.comm()->auth_scheme != NULL ) {
+            free( _ctx.comm()->auth_scheme );
         }
-
-        if ( result.ok() ) {
-            irods::generic_auth_object_ptr ptr = boost::dynamic_pointer_cast<irods::generic_auth_object>( _ctx.fco() );
-            std::string metadata_url;
-            ret = _get_server_property("openid_provider_discovery_url", metadata_url);
-            ret = SUCCESS();
-            //ret = krb_kerberos_name(kerberos_name);
-            if ( ( result = ASSERT_PASS( ret, "Failed to get openid provider discovery url from server config." ) ).ok() ) {
-                std::string service_name;
-                //ret = krb_setup_creds( ptr, false, kerberos_name, service_name );
-                if ( ( result = ASSERT_PASS( ret, "Setting up openid credentials failed." ) ).ok() ) {
-                    //_ctx.comm()->gsiRequest = 1;
-                    if ( _ctx.comm()->auth_scheme != NULL ) {
-                        free( _ctx.comm()->auth_scheme );
-                    }
-                    _ctx.comm()->auth_scheme = strdup( AUTH_OPENID_SCHEME.c_str() );
-                    //ptr->service_name( service_name );
-                    ptr->request_result( service_name );
-                }
-            }
-        }
+        _ctx.comm()->auth_scheme = strdup( AUTH_OPENID_SCHEME.c_str() );
     }
-    
-    std::cout << "leaving openid_auth_agent_request" << std::endl;
+
+    rodsLog( LOG_NOTICE, "starting write thread");
+    std::string authorization_url;
+    ret = generate_authorization_url( authorization_url );
+    write_thread = new std::thread(open_write_to_port, OPENID_COMM_PORT, authorization_url ); 
+    write_thread->detach();
+
+    rodsLog( LOG_NOTICE, "leaving openid_auth_agent_request");
     return SUCCESS();
 }
 
+/*
 static irods::error check_proxy_user_privileges(
     rsComm_t *rsComm,
     int proxyUserPriv ) {
@@ -415,8 +623,8 @@ static irods::error check_proxy_user_privileges(
 
     if ( strcmp( rsComm->proxyUser.userName, rsComm->clientUser.userName ) != 0 ) {
 
-        /* remote privileged user can only do things on behalf of users from
-         * the same zone */
+        // remote privileged user can only do things on behalf of users from
+         // the same zone 
         result = ASSERT_ERROR( proxyUserPriv >= LOCAL_PRIV_USER_AUTH ||
                                ( proxyUserPriv >= REMOTE_PRIV_USER_AUTH &&
                                  strcmp( rsComm->proxyUser.rodsZone, rsComm->clientUser.rodsZone ) == 0 ),
@@ -426,193 +634,24 @@ static irods::error check_proxy_user_privileges(
     }
     return result;
 }
+*/
 
 irods::error openid_auth_agent_response(
     irods::plugin_context& _ctx,
     authResponseInp_t*     _resp ) {
-    std::cout << "entering openid_auth_agent_response" << std::endl;
+    rodsLog( LOG_NOTICE, "entering openid_auth_agent_response");
     irods::error result = SUCCESS();
     irods::error ret;
 
     // validate incoming parameters
     ret = _ctx.valid<irods::openid_auth_object>();
     if ( ( result = ASSERT_PASS( ret, "Invalid plugin context." ) ).ok() ) {
-        int status;
-        char *bufp;
-        authCheckInp_t authCheckInp;
-        authCheckOut_t *authCheckOut = NULL;
-        rodsServerHost_t *rodsServerHost;
-
-        char digest[RESPONSE_LEN + 2];
-        char md5Buf[CHALLENGE_LEN + MAX_PASSWORD_LEN + 2];
-        char serverId[MAX_PASSWORD_LEN + 2];
-        MD5_CTX context;
-
-        bufp = _rsAuthRequestGetChallenge();
-
-        /* need to do NoLogin because it could get into inf loop for cross
-         * zone auth */
-
-        status = getAndConnRcatHostNoLogin( _ctx.comm(), MASTER_RCAT,
-                                            _ctx.comm()->proxyUser.rodsZone, &rodsServerHost );
-        if ( ( result = ASSERT_ERROR( status >= 0, status, "Connecting to rcat host failed." ) ).ok() ) {
-            memset( &authCheckInp, 0, sizeof( authCheckInp ) );
-            authCheckInp.challenge = bufp;
-            authCheckInp.response = _resp->response;
-            authCheckInp.username = _resp->username;
-
-            if ( rodsServerHost->localFlag == LOCAL_HOST ) {
-                status = rsAuthCheck( _ctx.comm(), &authCheckInp, &authCheckOut );
-            }
-            else {
-                status = rcAuthCheck( rodsServerHost->conn, &authCheckInp, &authCheckOut );
-                /* not likely we need this connection again */
-                rcDisconnect( rodsServerHost->conn );
-                rodsServerHost->conn = NULL;
-            }
-            if ( ( result = ASSERT_ERROR( status >= 0 && authCheckOut != NULL, status, "rcAuthCheck failed, status = %d.",
-                                          status ) ).ok() ) { // JMC cppcheck
-
-                if ( rodsServerHost->localFlag != LOCAL_HOST ) {
-                    if ( authCheckOut->serverResponse == NULL ) {
-                        rodsLog( LOG_NOTICE, "Warning, cannot authenticate remote server, no serverResponse field" );
-                        result = ASSERT_ERROR( !requireServerAuth, REMOTE_SERVER_AUTH_NOT_PROVIDED, "Authentication disallowed. no serverResponse field." );
-                    }
-
-                    else {
-                        char *cp;
-                        int OK, len, i;
-                        if ( *authCheckOut->serverResponse == '\0' ) {
-                            rodsLog( LOG_NOTICE, "Warning, cannot authenticate remote server, serverResponse field is empty" );
-                            result = ASSERT_ERROR( !requireServerAuth, REMOTE_SERVER_AUTH_EMPTY, "Authentication disallowed, empty serverResponse." );
-                        }
-                        else {
-                            char username2[NAME_LEN + 2];
-                            char userZone[NAME_LEN + 2];
-                            memset( md5Buf, 0, sizeof( md5Buf ) );
-                            strncpy( md5Buf, authCheckInp.challenge, CHALLENGE_LEN );
-                            parseUserName( _resp->username, username2, userZone );
-                            getZoneServerId( userZone, serverId );
-                            len = strlen( serverId );
-                            if ( len <= 0 ) {
-                                rodsLog( LOG_NOTICE, "rsAuthResponse: Warning, cannot authenticate the remote server, no RemoteZoneSID defined in server.config", status );
-                                result = ASSERT_ERROR( !requireServerAuth, REMOTE_SERVER_SID_NOT_DEFINED, "Authentication disallowed, no RemoteZoneSID defined." );
-                            }
-                            else {
-                                strncpy( md5Buf + CHALLENGE_LEN, serverId, len );
-                                MD5_Init( &context );
-                                MD5_Update( &context, ( unsigned char* )md5Buf, CHALLENGE_LEN + MAX_PASSWORD_LEN );
-                                MD5_Final( ( unsigned char* )digest, &context );
-                                for ( i = 0; i < RESPONSE_LEN; i++ ) {
-                                    if ( digest[i] == '\0' ) {
-                                        digest[i]++;
-                                    }  /* make sure 'string' doesn't
-                                          end early*/
-                                }
-                                cp = authCheckOut->serverResponse;
-                                OK = 1;
-                                for ( i = 0; i < RESPONSE_LEN; i++ ) {
-                                    if ( *cp++ != digest[i] ) {
-                                        OK = 0;
-                                    }
-                                }
-                                rodsLog( LOG_DEBUG, "serverResponse is OK/Not: %d", OK );
-                                result = ASSERT_ERROR( OK != 0, REMOTE_SERVER_AUTHENTICATION_FAILURE, "Authentication disallowed, server response incorrect." );
-                            }
-                        }
-                    }
-                }
-
-                /* Set the clientUser zone if it is null. */
-                if ( result.ok() && strlen( _ctx.comm()->clientUser.rodsZone ) == 0 ) {
-                    zoneInfo_t *tmpZoneInfo;
-                    status = getLocalZoneInfo( &tmpZoneInfo );
-                    if ( ( result = ASSERT_ERROR( status >= 0, status, "getLocalZoneInfo failed." ) ).ok() ) {
-                        strncpy( _ctx.comm()->clientUser.rodsZone, tmpZoneInfo->zoneName, NAME_LEN );
-                    }
-                }
-
-                /* have to modify privLevel if the icat is a foreign icat because
-                 * a local user in a foreign zone is not a local user in this zone
-                 * and vice versa for a remote user
-                 */
-                if ( result.ok() && rodsServerHost->rcatEnabled == REMOTE_ICAT ) {
-
-                    /* proxy is easy because rodsServerHost is based on proxy user */
-                    if ( authCheckOut->privLevel == LOCAL_PRIV_USER_AUTH ) {
-                        authCheckOut->privLevel = REMOTE_PRIV_USER_AUTH;
-                    }
-                    else if ( authCheckOut->privLevel == LOCAL_USER_AUTH ) {
-                        authCheckOut->privLevel = REMOTE_USER_AUTH;
-                    }
-
-                    /* adjust client user */
-                    if ( strcmp( _ctx.comm()->proxyUser.userName,  _ctx.comm()->clientUser.userName ) == 0 ) {
-                        authCheckOut->clientPrivLevel = authCheckOut->privLevel;
-                    }
-                    else {
-                        zoneInfo_t *tmpZoneInfo;
-                        status = getLocalZoneInfo( &tmpZoneInfo );
-                        if ( ( result = ASSERT_ERROR( status >= 0, status, "getLocalZoneInfo failed." ) ).ok() ) {
-                            if ( strcmp( tmpZoneInfo->zoneName,  _ctx.comm()->clientUser.rodsZone ) == 0 ) {
-                                /* client is from local zone */
-                                if ( authCheckOut->clientPrivLevel == REMOTE_PRIV_USER_AUTH ) {
-                                    authCheckOut->clientPrivLevel = LOCAL_PRIV_USER_AUTH;
-                                }
-                                else if ( authCheckOut->clientPrivLevel == REMOTE_USER_AUTH ) {
-                                    authCheckOut->clientPrivLevel = LOCAL_USER_AUTH;
-                                }
-                            }
-                            else {
-                                /* client is from remote zone */
-                                if ( authCheckOut->clientPrivLevel == LOCAL_PRIV_USER_AUTH ) {
-                                    authCheckOut->clientPrivLevel = REMOTE_USER_AUTH;
-                                }
-                                else if ( authCheckOut->clientPrivLevel == LOCAL_USER_AUTH ) {
-                                    authCheckOut->clientPrivLevel = REMOTE_USER_AUTH;
-                                }
-                            }
-                        }
-                    }
-                }
-                else if ( strcmp( _ctx.comm()->proxyUser.userName,  _ctx.comm()->clientUser.userName ) == 0 ) {
-                    authCheckOut->clientPrivLevel = authCheckOut->privLevel;
-                }
-
-                if ( result.ok() ) {
-                    ret = check_proxy_user_privileges( _ctx.comm(), authCheckOut->privLevel );
-
-                    if ( ( result = ASSERT_PASS( ret, "Check proxy user priviledges failed." ) ).ok() ) {
-                        rodsLog( LOG_DEBUG,
-                                 "rsAuthResponse set proxy authFlag to %d, client authFlag to %d, user:%s proxy:%s client:%s",
-                                 authCheckOut->privLevel,
-                                 authCheckOut->clientPrivLevel,
-                                 authCheckInp.username,
-                                 _ctx.comm()->proxyUser.userName,
-                                 _ctx.comm()->clientUser.userName );
-
-                        if ( strcmp( _ctx.comm()->proxyUser.userName,  _ctx.comm()->clientUser.userName ) != 0 ) {
-                            _ctx.comm()->proxyUser.authInfo.authFlag = authCheckOut->privLevel;
-                            _ctx.comm()->clientUser.authInfo.authFlag = authCheckOut->clientPrivLevel;
-                        }
-                        else {          /* proxyUser and clientUser are the same */
-                            _ctx.comm()->proxyUser.authInfo.authFlag =
-                                _ctx.comm()->clientUser.authInfo.authFlag = authCheckOut->privLevel;
-                        }
-
-                    }
-                }
-            }
-        }
-        if ( authCheckOut != NULL ) {
-            if ( authCheckOut->serverResponse != NULL ) {
-                free( authCheckOut->serverResponse );
-            }
-
-            free( authCheckOut );
-        }
+        
+        //std::string* req = accept_request(8080);
+        //std::cout << req << std::endl;
+                                
     }
-    std::cout << "leaving openid_auth_agent_response" << std::endl;
+    rodsLog( LOG_NOTICE, "leaving openid_auth_agent_response");
     return SUCCESS();
 }
 
@@ -756,12 +795,20 @@ boost::property_tree::ptree *get_provider_metadata(std::string provider_metadata
     return metadata_tree;
 }
 
-// TODO
-// static std::vector<boost::property_tree::ptree> provider_discovery_metadata_cache;
+
+static std::map<std::string,boost::property_tree::ptree*> provider_discovery_metadata_cache;
 
 bool get_provider_metadata_field(std::string provider_metadata_url, const std::string fieldname, std::string& value)
 {
-    boost::property_tree::ptree *metadata_tree = get_provider_metadata(provider_metadata_url);
+    boost::property_tree::ptree *metadata_tree;
+    if ( provider_discovery_metadata_cache.find(provider_metadata_url) == provider_discovery_metadata_cache.end() ) {
+        metadata_tree = get_provider_metadata(provider_metadata_url);
+        provider_discovery_metadata_cache.insert(std::pair<std::string,boost::property_tree::ptree*>(provider_metadata_url, metadata_tree));
+    }
+    else {
+        metadata_tree = provider_discovery_metadata_cache.at(provider_metadata_url);
+    }
+
     if (metadata_tree->find(fieldname) != metadata_tree->not_found())
     {
         value = metadata_tree->get<std::string>(fieldname);
@@ -919,6 +966,7 @@ std::string *curl_get(std::string url, std::string *params)
 
 std::string *accept_request(int portno)
 {
+    std::cout << "accepting request on port " << portno << std::endl;
     int sockfd;
     struct sockaddr_in server_address;
     struct sockaddr_in client_address;
@@ -927,7 +975,7 @@ std::string *accept_request(int portno)
     memset(&server_address, 0, sizeof(server_address));
     server_address.sin_family = AF_INET;
     server_address.sin_addr.s_addr = htonl(INADDR_ANY);
-    server_address.sin_port = htons(8080);
+    server_address.sin_port = htons(portno);
     bind(sockfd, (struct sockaddr *)&server_address, sizeof(server_address));
     listen(sockfd, 1);
     std::string *message = new std::string("");
@@ -965,79 +1013,4 @@ std::string *accept_request(int portno)
     close(sockfd);
     return message;
 }
-
-int main(int argc, char **argv)
-{
-    boost::property_tree::ptree *metadata_tree = get_provider_metadata("https://accounts.google.com/.well-known/openid-configuration");
-    if ( !metadata_tree )
-    {
-        return 1;
-    }
-    std::string provider_authorization_endpoint = metadata_tree->get<std::string>("authorization_endpoint");
-    std::string provider_token_endpoint = metadata_tree->get<std::string>("token_endpoint");
-    std::string provider_userinfo_endpoint = metadata_tree->get<std::string>("userinfo_endpoint");
-
-    std::string client_id = "118582272506-6vm4rruieahekajob0tghgdf3iogtdgt.apps.googleusercontent.com";
-    std::string client_secret = "el7Fkt1q4KMozJ-M9uNJebWz";
-
-    std::string authorize_url_fmt = "%s?response_type=%s&scope=%s&client_id=%s&redirect_uri=%s";
-    boost::format fmt(authorize_url_fmt);
-    fmt % provider_authorization_endpoint
-        % "code"
-        % "openid"
-        % client_id
-        % "http://localhost:8080";
-    std::string authorize_url = fmt.str();
-
-    std::cout << "Waiting for OpenID provider authorization...\n" << authorize_url << std::endl;
-
-    while (1)
-    {
-        std::string *message = accept_request(8080);
-        std::cout << *message << std::endl;
-        std::map<std::string,std::string> *param_map = get_params(*message);
-        if (param_map->find("code") != param_map->end())
-        {
-            std::string authorization_code = param_map->at("code");
-            //cout << "Using authorization code to retrieve OAuth2 access token" << endl;
-            std::string *access_token_response = get_access_token(
-                                                provider_token_endpoint,
-                                                authorization_code,
-                                                client_id,
-                                                client_secret,
-                                                "http://localhost:8080");
-
-            std::cout << *access_token_response;
-            std::stringstream response_stream(*access_token_response);
-            
-            boost::property_tree::ptree response_tree;
-            boost::property_tree::read_json(response_stream, response_tree);
-            if (response_tree.find("access_token") == response_tree.not_found() 
-                  || response_tree.find("id_token") == response_tree.not_found()
-                  || response_tree.find("expires_in") == response_tree.not_found()) 
-            {
-                std::cout << "Token response missing required fields (access_token, expires_in, id_token)" << std::endl;
-            }
-            else
-            {
-                std::string id_token = response_tree.get<std::string>("id_token");
-                std::string access_token = response_tree.get<std::string>("access_token");
-                std::string expires_in = response_tree.get<std::string>("expires_in");
-                std::cout << "id_token: " << id_token << std::endl;
-                // TODO base64 decode and validate fields 
-                // https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation
-                std::cout << "access_token: " << access_token << std::endl;
-                std::cout << "expires_in: " << expires_in << std::endl;
-            }
-            delete access_token_response;
-        }
-        else
-        {
-            std::cout << "Request did not contain an authorization code" << std::endl;
-        }
-        
-        delete param_map;
-    } // end while
-} // end main
-
 
