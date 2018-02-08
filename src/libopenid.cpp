@@ -16,6 +16,7 @@
 #include "irods_generic_auth_object.hpp"
 #include "irods_kvp_string_parser.hpp"
 #include "irods_server_properties.hpp"
+#include "irods_environment_properties.hpp"
 #include "irods_stacktrace.hpp"
 #include "miscServerFunct.hpp"
 #include "rodsErrorTable.h"
@@ -37,6 +38,8 @@
 #include <sstream>
 #include <map>
 #include <thread>
+#include <condition_variable>
+#include <mutex>
 #include <regex>
 #include <unistd.h>
 #include <fcntl.h>
@@ -81,11 +84,23 @@ std::string *get_access_token(std::string token_endpoint_url,
 
 bool get_provider_metadata_field(std::string provider_metadata_url, const std::string fieldname, std::string& value);
 irods::error generate_authorization_url(std::string& urlBuf);
-irods::error openid_authorize();
+irods::error openid_authorize(std::string& id_token, std::string& access_token);
 ///END DECLARATIONS
 
 #define OPENID_COMM_PORT 1357
 
+/*
+    Opens a socket connection to the irods_host set in ~/.irods/irods_environment.json
+    on port OPENID_COMM_PORT.  Reads two messages. Messages start with 4 bytes specifying the length,
+    followed immediately by the message. Bytes for the length are the raw bytes of an int, in order. (no hton/ntoh)
+
+    The first message is the authorization url. This is printed to stdout.  The user must navigate to this url in
+    order to authorize the server to communicate with the OIDC provider. 
+
+    The server will wait for the callback request from this url.  After receiving the callback, it will read the tokens
+    from the request and send them in a 2nd message to here on the same socket connection in a specifically formatted token
+    string.  This token string is written in the buf_out reference.
+*/
 void read_from_server(std::string* buf_out) {
     std::cout << "entering read_from_server" << std::endl;
     int sockfd, n_bytes;
@@ -99,7 +114,8 @@ void read_from_server(std::string* buf_out) {
         perror( "socket" );
         return;
     }
-    server = gethostbyname( "localhost" );
+    std::string irods_env_host = irods::get_environment_property<std::string&>("irods_host"); // TODO error check
+    server = gethostbyname( irods_env_host.c_str() ); // TODO this only handles hostnames, not IP addresses. ok?
     if ( server == NULL ) {
         fprintf( stderr, "No host found for localhost"); 
         return;
@@ -127,49 +143,36 @@ void read_from_server(std::string* buf_out) {
             // no more data
             break;
         }
-        std::cout << "received " << n_bytes << " bytes: " << buffer << std::endl;
+        //std::cout << "received " << n_bytes << " bytes: " << buffer << std::endl;
         buf_out->append( buffer );
         total_bytes += n_bytes;
         memset( buffer, 0, READ_LEN );
     }
-    
-    std::cout << "leaving read_from_server" << std::endl;
-}
+    // finished reading authorization url
+    std::cout << "OpenID Authorization URL: \n" << *buf_out << std::endl;
+    buf_out->clear();
 
-void wait_for_socket_data(int* sockp, std::string* buf) {
-    std::cout << "entering wait_for_socket_data" << std::endl;
-    int sockfd = *sockp;
-    char byte_buf[256];
-    memset( byte_buf, 0, 256 );
-    long n_bytes;
-    //struct sockaddr_in client_addr;
-    //memset( &client_addr, 0, sizeof( client_addr ) );
-    //socklen_t client_addr_len = sizeof( client_addr );
-    //listen( sockfd, 1 );
-    //int conn_fd = accept( sockfd, (struct sockaddr*) &client_addr, &client_addr_len );
-    struct timeval timeout;
-    timeout.tv_sec = 30; // 30 sec timeout
-    timeout.tv_usec = 0;
-    setsockopt( sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout) );
-    int data_len = 0; 
-    n_bytes = recv( sockfd, &data_len, sizeof(data_len), 0 /*MSG_PEEK*/ );
-    //data_len = ntohl(data_len);
-
-    std::cout << "socket data length: " << data_len << std::endl;
-    int total_bytes = 0;
+    // wait for token string now
+    read( sockfd, &data_len, sizeof( data_len ) );
+    total_bytes = 0;
     while ( total_bytes < data_len ) {
-        n_bytes = recv( sockfd, byte_buf, 256, 0);
-        if ( n_bytes == -1 ) break;
-        if ( n_bytes == 0 ) {
-            //close( conn_fd );
+        n_bytes = read( sockfd, buffer, READ_LEN );
+        if ( n_bytes == -1 ) {
+            // error reading
             break;
         }
-        std::cout << "received bytes: " << byte_buf << std::endl;
-        buf->append( byte_buf );
+        if ( n_bytes == 0 ) {
+            // no more data
+            break;
+        }
+        //std::cout << "received " << n_bytes << " bytes: " << buffer << std::endl;
+        buf_out->append( buffer );
         total_bytes += n_bytes;
-        memset( byte_buf, 0, 256 );
-    }
-    std::cout << "leaving wait_for_socket_data" << std::endl;
+        memset( buffer, 0, READ_LEN );
+    } // finished reading token string from server
+
+    close( sockfd ); 
+    std::cout << "leaving read_from_server" << std::endl;
 }
 
 
@@ -184,12 +187,7 @@ irods::error openid_auth_establish_context(
         return ERROR(SYS_INVALID_INPUT_PARAM, "Invalid plugin context.");
     }
     irods::generic_auth_object_ptr ptr = boost::dynamic_pointer_cast<irods::generic_auth_object>( _ctx.fco() );
-    // wait for message from server
-    //int sockfd = ptr->sock();
-    //std::string message;
-    //std::thread url_thread( wait_for_socket_data, &sockfd, &message );
-    //std::cout << "got message from server: " << message << std::endl;
-    //url_thread.join();
+
     std::cout << "leaving openid_auth_establish_context" << std::endl;
     return ret;
 }
@@ -225,10 +223,7 @@ irods::error openid_auth_client_start(
             else {
                 std::cout << "Password file contains: " << pwBuf << std::endl;
             }
-            std::string auth_url;
-            //int sockfd = _comm->sock;
-            //wait_for_socket_data( &sockfd, &auth_url );
-            //std::cout << "Client got url: " << auth_url << std::endl;
+            
         }
     }
     std::cout << "leaving openid_auth_client_start" << std::endl;
@@ -280,24 +275,30 @@ irods::error openid_auth_client_request(
     int status = rcAuthPluginRequest( _comm, &req_in, &req_out );
     
     // get authorization url from server
-    std::string authorization_url;
-    read_from_server( &authorization_url );
-    std::cout << "read from server: " << authorization_url << std::endl;
+    //std::string authorization_url;
+    //std::cout << "attempting to read authorization_url from server" << std::endl;
+    //read_from_server( &authorization_url );
+    //std::cout << "read authorization_url from server: " << authorization_url << std::endl;
+    
+    // server performs authorization, waits for client to authorize via above url
+    // get token string from server
+    std::string token_string;
+    std::cout << "attempting to read url and token from server" << std::endl;
+    read_from_server( &token_string ); // output is just the token string
+    std::cout << "read token_string from server: " << token_string << std::endl;
+    
+    // TODO base64 decode the id_token
+
+
 
     // handle errors and exit
     if ( status < 0 ) {
         return ERROR( status, "call to rcAuthPluginRequest failed." );
     }
     else {
-        // copy over resulting openid session token
-        // and cache the result in our auth object
-        // blocking wait for openid token from server
-        //std::string access_token;
-        //wait_for_socket_data( &sock, &access_token );
-        //std::cout << "OpenID Access Token: \n" << access_token << std::endl;
-
-        //ptr->request_result( access_token.c_str() );
-        //obfSavePw( 0, 0, 0, access_token.c_str() );
+        ptr->request_result( token_string.c_str() );
+        std::cout << "writing token_string to .irodsA" << std::endl;
+        obfSavePw( 0, 0, 0, token_string.c_str() );
         free( req_out );
         std::cout << "leaving openid_auth_client_request" << std::endl;
         return SUCCESS();
@@ -322,7 +323,7 @@ irods::error openid_auth_client_response(
 
             irods::kvp_map_t kvp;
             std::string auth_scheme_key = AUTH_OPENID_SCHEME;
-            kvp[irods::AUTH_SCHEME_KEY] = auth_scheme_key; //TODO refactor
+            kvp[irods::AUTH_SCHEME_KEY] = auth_scheme_key;
             std::string resp_str = irods::kvp_string( kvp );
 
             // =-=-=-=-=-=-=-
@@ -341,6 +342,10 @@ irods::error openid_auth_client_response(
             auth_response.username = username;
             int status = rcAuthResponse( _comm, &auth_response );
             result = ASSERT_ERROR( status >= 0, status, "Call to rcAuthResponse failed." );
+
+            // get access token from server
+            //std::string token_string;
+            //read_from_server( &token_string );
         }
     }
     std::cout << "leaving openid_auth_client_response" << std::endl;
@@ -348,27 +353,7 @@ irods::error openid_auth_client_response(
 }
 
 #ifdef RODS_SERVER
-/*
-irods::error openid_establish_context_serverside(
-    irods::plugin_context& _ctx,
-    rsComm_t* comm,
-    char* _clientName,
-    int _maxLen_clientName) {
-    irods::error result = SUCCESS();
-    irods::error ret;
 
-    ret = _ctx.valid<irods::generic_auth_object>();
-    if ( ( result = ASSERT_PASS( ret, "Invalid plugin context." ) ).ok() ) {
-        irods::generic_auth_object_ptr ptr = boost::dynamic_pointer_cast<irods::generic_auth_object>( _ctx.fco() );
-        int sockfd = comm->sock;
-        std::string msg("This is a message");
-        write( sockfd, msg.size(), sizeof(int) );
-        write( sockfd, msg.c_str(), msg.size() );
-
-    }
-
-}
-*/
 static irods::error _get_server_property(std::string key, std::string& buf) {
     try {
         buf = irods::get_server_property<std::string&>(key);
@@ -380,43 +365,6 @@ static irods::error _get_server_property(std::string key, std::string& buf) {
 }
 
 
-irods::error openid_establish_context_serverside(
-    irods::plugin_context& _ctx) {
-    irods::error result = SUCCESS();
-    irods::error ret;
-
-    if ( ( result = ASSERT_PASS( ret, "Invalid plugin context" ) ).ok() ) {
-        irods::generic_auth_object_ptr ptr = boost::dynamic_pointer_cast<irods::generic_auth_object>( _ctx.fco() );
-        //int sockfd = ptr->sock();
-        int sockfd = _ctx.comm()->sock;
-        std::string authorization_url;
-        ret = generate_authorization_url(authorization_url);
-        if ( !ret.ok() ) {
-            return ERROR(-1, "Could not generate authorization url");
-        }
-        std::cout << "Writing '" << authorization_url << "' to socket" << std::endl;
-        // write authorization url to socket
-        int write_len = authorization_url.size();
-        write( sockfd, &write_len, 4 );
-        write( sockfd, authorization_url.c_str(), authorization_url.size() );
-
-        if ( _ctx.comm()->auth_scheme != NULL ) {
-            free( _ctx.comm()->auth_scheme );
-        }
-        _ctx.comm()->auth_scheme = strdup( AUTH_OPENID_SCHEME.c_str() );
-        
-
-
-        // listen for authorization callback
-
-        //openid_authorize();
-
-        // set request result to the authorization url
-        //ptr->request_result( authorization_url );
-    }
-    return result;
-}
-
 irods::error openid_auth_agent_start(
     irods::plugin_context& _ctx,
     const char*            _inst_name) {
@@ -427,6 +375,12 @@ irods::error openid_auth_agent_start(
     
     if ( ( result = ASSERT_PASS( ret, "Invalid plugin context" ) ).ok() ) {
         irods::generic_auth_object_ptr ptr = boost::dynamic_pointer_cast<irods::generic_auth_object>( _ctx.fco() );
+        // Reset the auth scheme here
+        if ( _ctx.comm()->auth_scheme != NULL ) {
+            free( _ctx.comm()->auth_scheme );
+        }
+        //_ctx.comm()->auth_scheme = strdup( AUTH_OPENID_SCHEME.c_str() );
+        _ctx.comm()->auth_scheme = NULL;
         int status = 0;
         //char clientName[500];
         //genQueryInp_t genQueryInp;
@@ -439,22 +393,18 @@ irods::error openid_auth_agent_start(
         //int clientPrivLevel = 0;
         openidAuthReqStatus = 1;
         
-        openid_establish_context_serverside( _ctx );
+        //openid_establish_context_serverside( _ctx );
         
         //status = chkProxyUserPriv( _ctx.comm(), privLevel );
         if ( ( result = ASSERT_ERROR( status >= 0, status, "Failed checking proxy user priviledges." ) ).ok() ) {
-            //openid_authorize();
-
             // set comm priv levels
             //_ctx.comm()->proxyUser.authInfo.authFlag = privLevel;
             //_ctx.comm()->clientUser.authInfo.authFlag = clientPrivLevel;
 
-            // Reset the auth scheme here so we do not try to authenticate again unless the client requests it.
-            if ( _ctx.comm()->auth_scheme != NULL ) {
-                free( _ctx.comm()->auth_scheme );
-            }
-            _ctx.comm()->auth_scheme = strdup( AUTH_OPENID_SCHEME.c_str() ); 
+             
         }
+
+        //std::string* req = accept_request(8080);
     }
     rodsLog( LOG_NOTICE, "leaving openid_auth_agent_start");
     return result;
@@ -491,7 +441,7 @@ irods::error generate_authorization_url(std::string& urlBuf) {
     boost::format fmt(authorize_url_fmt);
     fmt % authorization_endpoint
         % "code"
-        % "openid"
+        % "openid%20profile"
         % client_id
         % redirect_uri; 
         
@@ -501,7 +451,8 @@ irods::error generate_authorization_url(std::string& urlBuf) {
 }
 
 
-irods::error openid_authorize() {
+irods::error openid_authorize(std::string& id_token, std::string& access_token) {
+    std::cout << "entering openid_authorize" << std::endl;
     std::string provider_discovery_url = irods::get_server_property<std::string>("openid_provider_discovery_url");
     std::string client_id = irods::get_server_property<std::string>("openid_client_id");
     std::string client_secret = irods::get_server_property<std::string>("openid_client_secret");
@@ -534,8 +485,8 @@ irods::error openid_authorize() {
             std::cout << "Token response missing required fields (access_token, expires_in, id_token)" << std::endl;
         }
         else {
-            std::string id_token = response_tree.get<std::string>("id_token");
-            std::string access_token = response_tree.get<std::string>("access_token");
+            id_token = response_tree.get<std::string>("id_token");
+            access_token = response_tree.get<std::string>("access_token");
             std::string expires_in = response_tree.get<std::string>("expires_in");
             std::cout << "id_token: " << id_token << std::endl;
             // TODO base64 decode and validate fields 
@@ -552,8 +503,20 @@ irods::error openid_authorize() {
     return SUCCESS();
 }
 
+/*  Need to synchronize between client and server.
+    Do not return from auth_agent_request until a port is open on the server because
+    when client returns from rsAuthPluginRequest, it will read from this port */
 std::thread* write_thread = NULL;
+std::mutex port_mutex;
+std::condition_variable port_is_open_cond;
+bool port_opened = false;
+/**/
+
 void open_write_to_port(int portno, std::string msg) {
+    std::unique_lock<std::mutex> lock(port_mutex);
+    //std::unique_lock<std::mutex> lock(port_mutex);
+
+    std::cout << "entering open_write_to_port" << std::endl;
     int sockfd, conn_sockfd;
     socklen_t clilen;
     struct sockaddr_in serv_addr, cli_addr;
@@ -571,6 +534,14 @@ void open_write_to_port(int portno, std::string msg) {
         return;
     }
     listen( sockfd, 1 );
+    
+    // notify that port is open so that main thread can continue and return
+    std::cout << "notifying port_is_open_cond" << std::endl;
+    port_opened = true;
+    lock.unlock();
+    port_is_open_cond.notify_all();
+    
+    // wait for a client connection
     clilen = sizeof( cli_addr );
     conn_sockfd = accept( sockfd, (struct sockaddr*) &cli_addr, &clilen );
     if ( conn_sockfd < 0 ) {
@@ -580,9 +551,31 @@ void open_write_to_port(int portno, std::string msg) {
     int msg_len = msg.size();
     write( conn_sockfd, &msg_len, sizeof( msg_len ) );
     write( conn_sockfd, msg.c_str(), msg_len );
-    close( conn_sockfd );
-    close( sockfd );
+    
+    // client should now browse to that url sent (msg)
+    // TODO check/verify timeout on openid_authorize function
+    std::string id_token;
+    std::string access_token;
+    openid_authorize( id_token, access_token );
+    std::cout << "returned from authorize" << std::endl;
+    //std::cout << "id_token: " << id_token << std::endl;
+    //std::cout << "access_token: " << access_token << std::endl;
 
+    std::string token_string;
+    token_string.append( id_token );
+    token_string.append("#");
+    token_string.append( access_token );
+    std::cout << "token_string: " << token_string << std::endl;
+
+    msg_len = token_string.size();
+    write( conn_sockfd, &msg_len, sizeof( msg_len ) );
+    write( conn_sockfd, token_string.c_str(), msg_len );
+
+    std::cout << "wrote token string to client socket" << std::endl;
+    close( conn_sockfd );
+
+    close( sockfd );
+    std::cout << "leaving open_write_to_port" << std::endl;
     // done writing, reset thread pointer;
     write_thread = NULL;
 }
@@ -608,9 +601,17 @@ irods::error openid_auth_agent_request(
     rodsLog( LOG_NOTICE, "starting write thread");
     std::string authorization_url;
     ret = generate_authorization_url( authorization_url );
-    write_thread = new std::thread(open_write_to_port, OPENID_COMM_PORT, authorization_url ); 
-    write_thread->detach();
+    
+    std::unique_lock<std::mutex> lock(port_mutex);
+    port_opened = false;
 
+    write_thread = new std::thread(open_write_to_port, OPENID_COMM_PORT, authorization_url ); 
+    //write_thread->detach();
+    while ( !port_opened ) {
+        port_is_open_cond.wait(lock);
+        std::cout << "cond woke up" << std::endl;
+    }
+    write_thread->detach();
     rodsLog( LOG_NOTICE, "leaving openid_auth_agent_request");
     return SUCCESS();
 }
@@ -646,10 +647,7 @@ irods::error openid_auth_agent_response(
     // validate incoming parameters
     ret = _ctx.valid<irods::openid_auth_object>();
     if ( ( result = ASSERT_PASS( ret, "Invalid plugin context." ) ).ok() ) {
-        
-        //std::string* req = accept_request(8080);
-        //std::cout << req << std::endl;
-                                
+        // nothing
     }
     rodsLog( LOG_NOTICE, "leaving openid_auth_agent_response");
     return SUCCESS();
