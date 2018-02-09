@@ -280,7 +280,7 @@ irods::error decode_id_token(
         std::cout << "output length: " << decoded_len << std::endl;
         
         // TODO check bug where last byte is not returned
-        base64_decode( in, segment.size()+1, decoded_buf, &decoded_len );;
+        base64_decode( in, segment.size(), decoded_buf, &decoded_len );;
 
         std::cout << "decoded result: " << decoded_buf << std::endl;
         // put the decoded buffer in the corresponding reference
