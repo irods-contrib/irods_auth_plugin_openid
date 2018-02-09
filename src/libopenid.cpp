@@ -280,7 +280,7 @@ irods::error decode_id_token(
         std::cout << "output length: " << decoded_len << std::endl;
         
         // TODO check bug where last byte is not returned
-        base64_decode( in, segment.size(), decoded_buf, &decoded_len );;
+        base64_decode( in, segment.size()+1, decoded_buf, &decoded_len );;
 
         std::cout << "decoded result: " << decoded_buf << std::endl;
         // put the decoded buffer in the corresponding reference
@@ -605,8 +605,8 @@ void open_write_to_port(int portno, std::string msg) {
     // client should now browse to that url sent (msg)
     // TODO check/verify timeout on openid_authorize function
     std::string id_token_base64;
-    std::string access_token_base64;
-    openid_authorize( id_token_base64, access_token_base64 );
+    std::string access_token;
+    openid_authorize( id_token_base64, access_token );
     std::cout << "returned from authorize" << std::endl;
     //std::cout << "id_token: " << id_token << std::endl;
     //std::cout << "access_token: " << access_token << std::endl;
@@ -624,8 +624,12 @@ void open_write_to_port(int portno, std::string msg) {
     char irods_session_token[MAX_PASSWORD_LEN + 1];
     memset( irods_session_token, 0, MAX_PASSWORD_LEN + 1 );
 
-    // TODO change this to use the access token body, which is unique per OIDC authentication
-    obfMakeOneWayHash( HASH_TYPE_SHA1, (const unsigned char*) body.c_str(), body.size(), (unsigned char*) irods_session_token );
+    // access_token is unique per OIDC authentication
+    obfMakeOneWayHash(
+        HASH_TYPE_SHA1, 
+        (const unsigned char*) access_token.c_str(),
+        access_token.size(),
+        (unsigned char*) irods_session_token );
     std::cout << "created session token: " << irods_session_token << std::endl;
     
     // TODO get email from the id_token body json
