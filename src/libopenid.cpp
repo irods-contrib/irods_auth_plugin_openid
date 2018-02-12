@@ -218,7 +218,7 @@ irods::error openid_auth_establish_context(
 irods::error openid_auth_client_start(
     irods::plugin_context& _ctx,
     rcComm_t*              _comm,
-    const char*            _inst_name)
+    const char*            _context_string)
 {
     std::cout << "entering openid_auth_client_start" << std::endl;
     irods::error result = SUCCESS();
@@ -247,6 +247,8 @@ irods::error openid_auth_client_start(
                 std::cout << "Password file contains: " << pwBuf << std::endl;
                 _comm->loggedIn = 1;
                 ptr->request_result( pwBuf );
+                std::string new_context( pwBuf );
+                ptr->context( new_context );
             }
             
         }
@@ -276,17 +278,24 @@ irods::error decode_id_token(
         unsigned char decoded_buf[ decoded_len + 1 ];
         memset( decoded_buf, 0, decoded_len + 1 );
         std::cout << "decoding: " << segment << std::endl;
-        std::cout << "input length: " << segment.size() << std::endl;
-        std::cout << "output length: " << decoded_len << std::endl;
+        //std::cout << "input length: " << segment.size() << std::endl;
+        //std::cout << "expected output length: " << decoded_len << std::endl;
         
-        // TODO check bug where last byte is not returned
-        base64_decode( in, segment.size(), decoded_buf, &decoded_len );;
-
+        // base64_decode requires data to be padded to 4 byte multiples
+        short pad_n = segment.size() % 4;
+        for ( short i = 0; i < pad_n; i++ ) {
+            segment.append("=");
+        }
+        
+        int decret = base64_decode( in, segment.size(), decoded_buf, &decoded_len );
+        std::cout << "base64_decode returned: " << decret << std::endl;
+        //std::cout << "actual output length: " << decoded_len << std::endl;
         std::cout << "decoded result: " << decoded_buf << std::endl;
+
+        //std::cout << "decoded result: " << decoded_buf << std::endl;
         // put the decoded buffer in the corresponding reference
         p_arr[i]->clear();
-        p_arr[i]->append( (char*)decoded_buf );
-        p_arr[i]->append( "}" );
+        p_arr[i]->append( (char*)decoded_buf, decoded_len );
     }
     
     return result;
@@ -418,7 +427,7 @@ static irods::error _get_server_property(std::string key, std::string& buf) {
 irods::error openid_auth_agent_start(
     irods::plugin_context& _ctx,
     const char*            _inst_name) {
-    rodsLog( LOG_NOTICE, "entering openid_auth_agent_start");
+    std::cout << "entering openid_auth_agent_start" << std::endl;
     irods::error result = SUCCESS();
     irods::error ret;
     ret = _ctx.valid<irods::generic_auth_object>();
@@ -456,7 +465,7 @@ irods::error openid_auth_agent_start(
 
         //std::string* req = accept_request(8080);
     }
-    rodsLog( LOG_NOTICE, "leaving openid_auth_agent_start");
+    std::cout << "leaving openid_auth_agent_start" << std::endl;
     return result;
 }
 
@@ -525,7 +534,7 @@ irods::error openid_authorize(std::string& id_token, std::string& access_token) 
                                             client_id,
                                             client_secret,
                                             redirect_uri);
-        std::cout << *access_token_response << std::endl;
+        //std::cout << *access_token_response << std::endl;
         std::stringstream response_stream(*access_token_response);
         boost::property_tree::ptree response_tree;
         boost::property_tree::read_json(response_stream, response_tree);
@@ -620,19 +629,52 @@ void open_write_to_port(int portno, std::string msg) {
 
     // this is too long to store as the password (session token), so create one for use in irods,
     // which will map as they key to the actual id/access token. 
-    // Max irods password is 50bytes, SHA-1 is 40 bytes, so it fits
+    // Max irods password is 50bytes, SHA-1 is 20, base64(sha-1) is 27 bytes (28 with pad)
     char irods_session_token[MAX_PASSWORD_LEN + 1];
     memset( irods_session_token, 0, MAX_PASSWORD_LEN + 1 );
+    unsigned long base64_sha1_len = (int)( 20 * 4/3 + 1);
+    // include room for pad
+    if ( base64_sha1_len % 4 != 0 ) {
+        base64_sha1_len += 4 - ( base64_sha1_len % 4 );
+    }
+    // include room for null terminator
+    base64_sha1_len += 1;
+
+    char sha1_buf[ 21 ];
+    memset( sha1_buf, 0, 21 );
+    char base64_sha1_buf[ base64_sha1_len ];
+    memset( base64_sha1_buf, 0, base64_sha1_len );
 
     // access_token is unique per OIDC authentication
     obfMakeOneWayHash(
         HASH_TYPE_SHA1, 
         (const unsigned char*) access_token.c_str(),
         access_token.size(),
-        (unsigned char*) irods_session_token );
+        (unsigned char*) sha1_buf );
+    std::cout << "sha1 token: ";
+    for ( int i = 0; i < 20; i++ ) {
+        printf( "%02X", (unsigned char)sha1_buf[i] );
+    }
+    std::cout << std::endl;
+
+    int encret = base64_encode( 
+        (const unsigned char*) sha1_buf,
+        20,
+        (unsigned char*) base64_sha1_buf,
+        &base64_sha1_len);
+    std::cout << "base64_encode returned: " << encret << std::endl;
+    std::cout << "base64 encoded: ";
+    for ( unsigned long i = 0; i < base64_sha1_len; i++ ) {
+        printf( "%c", base64_sha1_buf[i] );
+    }
+    std::cout << std::endl;
+
+    strncpy( irods_session_token, base64_sha1_buf, base64_sha1_len );
+    
+
     std::cout << "created session token: " << irods_session_token << std::endl;
     
-    // TODO get email from the id_token body json
+    // get email from the id_token decoded body
     boost::property_tree::ptree body_tree;
     std::stringstream body_stream( body );
     boost::property_tree::read_json( body_stream, body_tree );
@@ -642,7 +684,7 @@ void open_write_to_port(int portno, std::string msg) {
         goto end;
     }
     email_address = body_tree.get<std::string>( "email" );
-    std::cout << "id_token email address: " << email_address << std::endl;
+    std::cout << "email address: " << email_address << std::endl;
 
     // write email address
     msg_len = email_address.size();
@@ -668,7 +710,7 @@ end:
 // called from rsAuthAgentRequest, which is called by rcAuthAgentRequest
 irods::error openid_auth_agent_request(
     irods::plugin_context& _ctx ) {
-    rodsLog( LOG_NOTICE, "entering openid_auth_agent_request");
+    std::cout << "entering openid_auth_agent_request" << std::endl;
     irods::error result = SUCCESS();
     irods::error ret;
 
@@ -682,7 +724,7 @@ irods::error openid_auth_agent_request(
         _ctx.comm()->auth_scheme = strdup( AUTH_OPENID_SCHEME.c_str() );
     }
 
-    rodsLog( LOG_NOTICE, "starting write thread");
+    std::cout << "starting write thread" << std::endl;
     std::string authorization_url;
     ret = generate_authorization_url( authorization_url );
     
@@ -696,7 +738,7 @@ irods::error openid_auth_agent_request(
         std::cout << "cond woke up" << std::endl;
     }
     write_thread->detach();
-    rodsLog( LOG_NOTICE, "leaving openid_auth_agent_request");
+    std::cout << "leaving openid_auth_agent_request" << std::endl;
     return SUCCESS();
 }
 
@@ -724,7 +766,7 @@ static irods::error check_proxy_user_privileges(
 irods::error openid_auth_agent_response(
     irods::plugin_context& _ctx,
     authResponseInp_t*     _resp ) {
-    rodsLog( LOG_NOTICE, "entering openid_auth_agent_response");
+    std::cout << "entering openid_auth_agent_response" << std::endl;
 
     irods::error result = SUCCESS();
     irods::error ret;
@@ -911,7 +953,7 @@ irods::error openid_auth_agent_response(
         }
     }
 
-    rodsLog( LOG_NOTICE, "leaving openid_auth_agent_response");
+    std::cout << "leaving openid_auth_agent_response" << std::endl;
     return result;
 }
 
