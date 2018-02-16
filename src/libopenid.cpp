@@ -27,6 +27,10 @@
 #include "rsAuthCheck.hpp"
 #include "rsAuthResponse.hpp"
 #include "rsAuthRequest.hpp"
+
+//#include "modAVUMetadata.h"
+#include "rsModAVUMetadata.hpp"
+
 #endif
 
 #include <openssl/md5.h>
@@ -91,6 +95,11 @@ irods::error openid_authorize(std::string& id_token, std::string& access_token);
 ///END DECLARATIONS
 
 #define OPENID_COMM_PORT 1357
+#define OPENID_ACCESS_TOKEN_KEY "access_token"
+#define OPENID_ID_TOKEN_KEY "id_token"
+#define OPENID_EXPIRY_KEY "expiry"
+#define OPENID_USER_METADATA_ATTR_PREFIX "openid_sess_"
+
 
 /*
     Opens a socket connection to the irods_host set in ~/.irods/irods_environment.json
@@ -167,7 +176,7 @@ void read_from_server(std::string* email, std::string* session_token) {
             // no more data
             break;
         }
-        std::cout << "received " << n_bytes << " bytes: " << buffer << std::endl;
+        //std::cout << "received " << n_bytes << " bytes: " << buffer << std::endl;
         email->append( buffer );
         total_bytes += n_bytes;
         memset( buffer, 0, READ_LEN );
@@ -187,7 +196,7 @@ void read_from_server(std::string* email, std::string* session_token) {
             // no more data
             break;
         }
-        std::cout << "received " << n_bytes << " bytes: " << buffer << std::endl;
+        //std::cout << "received " << n_bytes << " bytes: " << buffer << std::endl;
         session_token->append( buffer );
         total_bytes += n_bytes;
         memset( buffer, 0, READ_LEN );
@@ -246,9 +255,13 @@ irods::error openid_auth_client_start(
             else {
                 std::cout << "Password file contains: " << pwBuf << std::endl;
                 _comm->loggedIn = 1;
-                ptr->request_result( pwBuf );
-                std::string new_context( pwBuf );
-                ptr->context( new_context );
+                //ptr->request_result( pwBuf );
+                
+                // set the password in the context string
+                irods::kvp_map_t ctx_map;
+                ctx_map[irods::AUTH_PASSWORD_KEY] = pwBuf;
+                std::string new_context_str = irods::escaped_kvp_string( ctx_map );
+                ptr->context( new_context_str );
             }
             
         }
@@ -534,7 +547,7 @@ irods::error openid_authorize(std::string& id_token, std::string& access_token) 
                                             client_id,
                                             client_secret,
                                             redirect_uri);
-        //std::cout << *access_token_response << std::endl;
+        std::cout << "Access token response: " << *access_token_response << std::endl;
         std::stringstream response_stream(*access_token_response);
         boost::property_tree::ptree response_tree;
         boost::property_tree::read_json(response_stream, response_tree);
@@ -542,6 +555,7 @@ irods::error openid_authorize(std::string& id_token, std::string& access_token) 
             || response_tree.find("id_token") == response_tree.not_found()
             || response_tree.find("expires_in") == response_tree.not_found()) {
             std::cout << "Token response missing required fields (access_token, expires_in, id_token)" << std::endl;
+            return ERROR( -1, "Token response indicated an error in the request" );
         }
         else {
             id_token = response_tree.get<std::string>("id_token");
@@ -571,7 +585,7 @@ std::condition_variable port_is_open_cond;
 bool port_opened = false;
 /**/
 
-void open_write_to_port(int portno, std::string msg) {
+void open_write_to_port(/*irods::generic_aurh_object_ptr ptr*/ rsComm_t* comm, int portno, std::string msg) {
     std::unique_lock<std::mutex> lock(port_mutex);
     //std::unique_lock<std::mutex> lock(port_mutex);
 
@@ -620,9 +634,7 @@ void open_write_to_port(int portno, std::string msg) {
     //std::cout << "id_token: " << id_token << std::endl;
     //std::cout << "access_token: " << access_token << std::endl;
  
-    // TODO generate the username (email from OIDC provider) and the session token to use in irods
-    
-    // TODO base64 decode the id_token to get profile info from it (name, email)
+    // base64 decode the id_token to get profile info from it (name, email)
     std::string header, body;
     decode_id_token( id_token_base64, &header, &body );
     std::cout << "decoded id_token: " << body << std::endl;
@@ -645,7 +657,7 @@ void open_write_to_port(int portno, std::string msg) {
     char base64_sha1_buf[ base64_sha1_len ];
     memset( base64_sha1_buf, 0, base64_sha1_len );
 
-    // access_token is unique per OIDC authentication
+    // access_token is unique per OIDC authentication so use in in sess id
     obfMakeOneWayHash(
         HASH_TYPE_SHA1, 
         (const unsigned char*) access_token.c_str(),
@@ -670,8 +682,6 @@ void open_write_to_port(int portno, std::string msg) {
     std::cout << std::endl;
 
     strncpy( irods_session_token, base64_sha1_buf, base64_sha1_len );
-    
-
     std::cout << "created session token: " << irods_session_token << std::endl;
     
     // get email from the id_token decoded body
@@ -681,10 +691,44 @@ void open_write_to_port(int portno, std::string msg) {
     std::string email_address;
     if ( body_tree.find( "email" ) == body_tree.not_found() ) {
         std::cout << "Email not in the response returned by OIDC Provider" << std::endl;
-        goto end;
+        close( conn_sockfd );
+        close( sockfd );
+        std::cout << "leaving open_write_to_port" << std::endl;
     }
     email_address = body_tree.get<std::string>( "email" );
     std::cout << "email address: " << email_address << std::endl;
+    
+
+    // put email + session token in the server database
+    // https://github.com/irods/irods/blob/master/plugins/database/src/low_level_odbc.cpp#L371
+    // TODO use bind vars for user_name
+    // not sure best way to store these tokens
+    // user attribute: lib/api/include/modAVUMetadata.h
+    // format: imeta add -u <username> <keyname> <value>
+
+    // plugins/database/src/db_plugin.cpp:9320 actual call
+    modAVUMetadataInp_t avu_inp;
+    memset( &avu_inp, 0, sizeof( avu_inp ) );
+    std::string operation("add");
+    std::string obj_type("-u");
+    avu_inp.arg0 = (char*)operation.c_str(); // operation
+    avu_inp.arg1 = (char*)obj_type.c_str(); // obj type
+    avu_inp.arg2 = (char*)email_address.c_str(); // username
+    avu_inp.arg3 = irods_session_token; // key
+
+    // will need to jam more info in here, like expiry
+    avu_inp.arg4 = (char*)access_token.c_str(); // value
+    std::stringstream meta_val;
+    //meta_val << 
+    std::string expiry = "9999-12-31 12:00:00+00:00";
+
+    // ELEVATE PRIV LEVEL
+    int old_auth_flag = comm->clientUser.authInfo.authFlag;
+    comm->clientUser.authInfo.authFlag = LOCAL_PRIV_USER_AUTH;
+    int avu_ret = rsModAVUMetadata( comm, &avu_inp );
+    std::cout << "rsModAVUMetadata returned: " << avu_ret << std::endl;
+    // RESET PRIV LEVEL
+    comm->clientUser.authInfo.authFlag = old_auth_flag;
 
     // write email address
     msg_len = email_address.size();
@@ -692,14 +736,13 @@ void open_write_to_port(int portno, std::string msg) {
     write( conn_sockfd, email_address.c_str(), msg_len ); 
 
     // write session token 
-    msg_len = 40; // SHA-1 length
+    msg_len = base64_sha1_len; // length of token is always the same
     write( conn_sockfd, &msg_len, sizeof( msg_len ) );
     write( conn_sockfd, irods_session_token, msg_len );
 
     std::cout << "wrote username and irods session token to client socket" << std::endl;
-end:
-    close( conn_sockfd );
 
+    close( conn_sockfd );
     close( sockfd );
     std::cout << "leaving open_write_to_port" << std::endl;
     // done writing, reset thread pointer;
@@ -713,25 +756,124 @@ irods::error openid_auth_agent_request(
     std::cout << "entering openid_auth_agent_request" << std::endl;
     irods::error result = SUCCESS();
     irods::error ret;
-
+    irods::generic_auth_object_ptr ptr;
     // validate incoming parameters
     ret = _ctx.valid<irods::generic_auth_object>();
     if ( ( result = ASSERT_PASS( ret, "Invalid plugin context." ) ).ok() ) {
-        irods::generic_auth_object_ptr ptr = boost::dynamic_pointer_cast<irods::generic_auth_object>( _ctx.fco() );
+        ptr = boost::dynamic_pointer_cast<irods::generic_auth_object>( _ctx.fco() );
         if ( _ctx.comm()->auth_scheme != NULL ) {
             free( _ctx.comm()->auth_scheme );
         }
         _ctx.comm()->auth_scheme = strdup( AUTH_OPENID_SCHEME.c_str() );
+
+        // print the context string, this should have the user/sess in it
+        std::string ctx_str = ptr->context();
+        std::cout << "auth_agent_request got context: " << ctx_str << std::endl;
+        irods::kvp_map_t ctx_map;
+        ret = irods::parse_escaped_kvp_string( ctx_str, ctx_map );
+        if ( !ret.ok() ) {
+            std::cout << "Could not parse context string sent from client: " << ctx_str << std::endl;
+            return PASS( ret );
+        }
+        std::string username = ctx_map[irods::AUTH_USER_KEY];
+        std::string session_id = ctx_map[irods::AUTH_PASSWORD_KEY];
+        if ( username.size() == 0 || session_id.size() == 0 ) {
+            // TODO no creds sent from client
+
+            // put authorization code here
+        }
+        else {
+            // TODO got creds, verify in DB
+            // unfortunately there's no pretty way to lookup avu, like there is for modifying them
+            // using similar method to irods_client_icommands/src/imeta.cpp:473 (showUser)
+            genQueryOut_t *genQueryOut;
+            genQueryInp_t genQueryInp;
+            memset( &genQueryInp, 0, sizeof( genQueryInp ) );
+            int i1a[10];
+            int i1b[10];
+            int i2a[10];
+            char *condVal[10];
+            const char *columnNames[] = {"attribute", "value", "units"};
+            
+            // select
+            i1a[0] = COL_META_USER_ATTR_NAME;
+            i1b[0] = 0;
+            i1a[1] = COL_META_USER_ATTR_VALUE;
+            i1b[1] = 0;
+            i1a[2] = COL_META_USER_ATTR_UNITS;
+            i1b[2] = 0;
+            genQueryInp.selectInp.inx = i1a;
+            genQueryInp.selectInp.value = i1b;
+            genQueryInp.selectInp.len = 3;
+
+            // where conditions
+            i2a[0] = COL_USER_NAME;
+            std::string v1;
+            v1 = "='";
+            v1 += username;
+            v1 += "'";
+            //ignore zone
+            //i2a[1] = COL_USER_ZONE;
+            //std::string v2;
+            //v2 = "='";
+            //v2 += userzone;
+            //v2 += "'";
+            genQueryInp.sqlCondInp.inx = i2a;
+            genQueryInp.sqlCondInp.value = condVal;
+            genQueryInp.sqlCondInp.len = 1;
+            
+            // where attr = session_id
+            i2a[1] = COL_META_USER_ATTR_NAME;
+            // look for "openid_sess_<irodssessiontoken>
+            std::string v2;
+            v2 = "='";
+            v2 += OPENID_USER_METADATA_ATTR_PREFIX;
+            v2 += session_id;
+            v2 += "'";
+            condVal[1] = const_cast<char*>( v2.c_str() );
+            genQueryInp.sqlCondInp.len++;
+            
+            genQueryInp.maxRows = 10;
+            genQueryInp.continueInx = 0;
+            genQueryInp.condInput.len = 0;
+
+            int query_status = rsGenQuery( _ctx.comm(), &genQueryInp, &genQueryOut );
+            if ( query_status == CAT_NO_ROWS_FOUND ) {
+                // this session id does not exist
+                return ERROR( -1, "Session id not recognized. Please re-authenticate via iinit" );
+            }
+            if ( genQueryOut->rowCnt != 1 ) {
+                // multiple metadata entries matched this session id, not good
+                return ERROR( -1, "Improper session state on server." );
+            }
+            // get the result of the query
+            char *result;
+            for ( int i = 0; i < genQueryOut->attriCnt; i++ ) {
+                //TODO
+                // not sure if this will work, because it doesn't specify a table to use, how does imeta do this?
+            }
+
+            // ELEVATE PRIV LEVEL
+            int old_auth_flag = _ctx.comm()->clientUser.authInfo.authFlag;
+            _ctx.comm()->clientUser.authInfo.authFlag = LOCAL_PRIV_USER_AUTH;
+            //int avu_ret = rsModAVUMetadata( _ctx.comm(), &avu_inp );
+            //std::cout << "rsModAVUMetadata returned: " << avu_ret << std::endl;
+            // RESET PRIV LEVEL
+            _ctx.comm()->clientUser.authInfo.authFlag = old_auth_flag; 
+        }
     }
 
-    std::cout << "starting write thread" << std::endl;
+    std::cout << "generating authorization url" << std::endl;
     std::string authorization_url;
     ret = generate_authorization_url( authorization_url );
-    
+    if ( !ret.ok() ) {
+        return ret;
+    }
     std::unique_lock<std::mutex> lock(port_mutex);
     port_opened = false;
 
-    write_thread = new std::thread(open_write_to_port, OPENID_COMM_PORT, authorization_url ); 
+    std::cout << "starting write thread" << std::endl;
+    write_thread = new std::thread(open_write_to_port, _ctx.comm(), OPENID_COMM_PORT, authorization_url ); 
     //write_thread->detach();
     while ( !port_opened ) {
         port_is_open_cond.wait(lock);
@@ -1065,9 +1207,16 @@ void send_success(int sockfd)
  */
 boost::property_tree::ptree *get_provider_metadata(std::string provider_metadata_url)
 {
+    std::cout << "get_provider_metadata: " << provider_metadata_url << std::endl;
     boost::property_tree::ptree *metadata_tree = new boost::property_tree::ptree();
     std::string params = "";
     std::string *metadata_string = curl_get(provider_metadata_url, &params);
+    if ( metadata_string->size() == 0 ) {
+        std::cout << "no metadata returned" << std::endl;
+        delete metadata_tree;
+        return NULL;
+    }
+
     std::cout << "Provider metadata: " << std::endl << *metadata_string << std::endl;
     std::stringstream metadata_stream(*metadata_string);
     
@@ -1105,6 +1254,9 @@ bool get_provider_metadata_field(std::string provider_metadata_url, const std::s
     boost::property_tree::ptree *metadata_tree;
     if ( provider_discovery_metadata_cache.find(provider_metadata_url) == provider_discovery_metadata_cache.end() ) {
         metadata_tree = get_provider_metadata(provider_metadata_url);
+        if ( !metadata_tree ) {
+            return false;
+        }
         provider_discovery_metadata_cache.insert(std::pair<std::string,boost::property_tree::ptree*>(provider_metadata_url, metadata_tree));
     }
     else {
@@ -1252,6 +1404,7 @@ std::string *curl_get(std::string url, std::string *params)
     std::string *response = new std::string();
     if (curl)
     {
+        std::cout << "CURLOPT_URL: " << url.c_str() << std::endl;
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, _curl_writefunction_callback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, response);
