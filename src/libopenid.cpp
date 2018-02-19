@@ -261,6 +261,7 @@ irods::error openid_auth_client_start(
                 irods::kvp_map_t ctx_map;
                 ctx_map[irods::AUTH_PASSWORD_KEY] = pwBuf;
                 std::string new_context_str = irods::escaped_kvp_string( ctx_map );
+                std::cout << "setting context: " << new_context_str << std::endl;
                 ptr->context( new_context_str );
             }
             
@@ -290,7 +291,7 @@ irods::error decode_id_token(
         unsigned long decoded_len = (int)(segment.size() * (3.0/4) + 0.5);
         unsigned char decoded_buf[ decoded_len + 1 ];
         memset( decoded_buf, 0, decoded_len + 1 );
-        std::cout << "decoding: " << segment << std::endl;
+        //std::cout << "decoding: " << segment << std::endl;
         //std::cout << "input length: " << segment.size() << std::endl;
         //std::cout << "expected output length: " << decoded_len << std::endl;
         
@@ -301,9 +302,14 @@ irods::error decode_id_token(
         }
         
         int decret = base64_decode( in, segment.size(), decoded_buf, &decoded_len );
-        std::cout << "base64_decode returned: " << decret << std::endl;
+        if ( decret != 0 ) {
+            std::string err_msg("Base64 decoding failed on ");
+            err_msg += segment;
+            return ERROR( -1, err_msg );
+        }
+        //std::cout << "base64_decode returned: " << decret << std::endl;
         //std::cout << "actual output length: " << decoded_len << std::endl;
-        std::cout << "decoded result: " << decoded_buf << std::endl;
+        //std::cout << "decoded result: " << decoded_buf << std::endl;
 
         //std::cout << "decoded result: " << decoded_buf << std::endl;
         // put the decoded buffer in the corresponding reference
@@ -336,7 +342,10 @@ irods::error openid_auth_client_request(
     std::string context = ptr->context();
 
     // set up context string
-    context += irods::kvp_delimiter() + irods::AUTH_USER_KEY + irods::kvp_association() + ptr->user_name(); 
+    if ( !context.empty() ) {
+        context += irods::kvp_delimiter();
+    }
+    context += irods::AUTH_USER_KEY + irods::kvp_association() + ptr->user_name(); 
 
     if ( context.size() > MAX_NAME_LEN ) {
         return ERROR( SYS_INVALID_INPUT_PARAM, "context string > max name len" );
@@ -631,8 +640,6 @@ void open_write_to_port(/*irods::generic_aurh_object_ptr ptr*/ rsComm_t* comm, i
     std::string access_token;
     openid_authorize( id_token_base64, access_token );
     std::cout << "returned from authorize" << std::endl;
-    //std::cout << "id_token: " << id_token << std::endl;
-    //std::cout << "access_token: " << access_token << std::endl;
  
     // base64 decode the id_token to get profile info from it (name, email)
     std::string header, body;
@@ -714,7 +721,13 @@ void open_write_to_port(/*irods::generic_aurh_object_ptr ptr*/ rsComm_t* comm, i
     avu_inp.arg0 = (char*)operation.c_str(); // operation
     avu_inp.arg1 = (char*)obj_type.c_str(); // obj type
     avu_inp.arg2 = (char*)email_address.c_str(); // username
-    avu_inp.arg3 = irods_session_token; // key
+    
+    size_t prefix_len = strlen( OPENID_USER_METADATA_ATTR_PREFIX );
+    char metadata_key[ prefix_len + MAX_PASSWORD_LEN ];
+    memset( metadata_key, 0, prefix_len + MAX_PASSWORD_LEN );
+    strncpy( metadata_key, OPENID_USER_METADATA_ATTR_PREFIX, prefix_len );
+    strncpy( metadata_key + prefix_len, irods_session_token, strlen( irods_session_token ) );
+    avu_inp.arg3 = metadata_key; // key
 
     // will need to jam more info in here, like expiry
     avu_inp.arg4 = (char*)access_token.c_str(); // value
@@ -749,6 +762,9 @@ void open_write_to_port(/*irods::generic_aurh_object_ptr ptr*/ rsComm_t* comm, i
     write_thread = NULL;
 }
 
+
+
+
 // server receives request from client 
 // called from rsAuthAgentRequest, which is called by rcAuthAgentRequest
 irods::error openid_auth_agent_request(
@@ -775,64 +791,42 @@ irods::error openid_auth_agent_request(
             std::cout << "Could not parse context string sent from client: " << ctx_str << std::endl;
             return PASS( ret );
         }
-        std::string username = ctx_map[irods::AUTH_USER_KEY];
+        //std::string username = ctx_map[irods::AUTH_USER_KEY];
+        std::string username = ptr->user_name();
         std::string session_id = ctx_map[irods::AUTH_PASSWORD_KEY];
-        if ( username.size() == 0 || session_id.size() == 0 ) {
-            // TODO no creds sent from client
-
+        if ( /*username.size() == 0 ||*/ session_id.size() == 0 ) {
+            // no creds sent from client
+            std::cout << "client sent no credentials" << std::endl;
             // put authorization code here
         }
-        else {
-            // TODO got creds, verify in DB
-            // unfortunately there's no pretty way to lookup avu, like there is for modifying them
+        if ( /*username.size() != 0 &&*/ session_id.size() != 0 ) {
+            // got creds, verify in DB
             // using similar method to irods_client_icommands/src/imeta.cpp:473 (showUser)
             genQueryOut_t *genQueryOut;
             genQueryInp_t genQueryInp;
             memset( &genQueryInp, 0, sizeof( genQueryInp ) );
-            int i1a[10];
-            int i1b[10];
-            int i2a[10];
-            char *condVal[10];
-            const char *columnNames[] = {"attribute", "value", "units"};
             
             // select
-            i1a[0] = COL_META_USER_ATTR_NAME;
-            i1b[0] = 0;
-            i1a[1] = COL_META_USER_ATTR_VALUE;
-            i1b[1] = 0;
-            i1a[2] = COL_META_USER_ATTR_UNITS;
-            i1b[2] = 0;
-            genQueryInp.selectInp.inx = i1a;
-            genQueryInp.selectInp.value = i1b;
-            genQueryInp.selectInp.len = 3;
+            addInxIval( &genQueryInp.selectInp, COL_META_USER_ATTR_NAME, 0 );
+            addInxIval( &genQueryInp.selectInp, COL_META_USER_ATTR_VALUE, 0 );
+            addInxIval( &genQueryInp.selectInp, COL_META_USER_ATTR_UNITS, 0 );
+            addInxIval( &genQueryInp.selectInp, COL_USER_NAME, 0 );
 
             // where conditions
-            i2a[0] = COL_USER_NAME;
-            std::string v1;
-            v1 = "='";
-            v1 += username;
-            v1 += "'";
-            //ignore zone
-            //i2a[1] = COL_USER_ZONE;
-            //std::string v2;
-            //v2 = "='";
-            //v2 += userzone;
-            //v2 += "'";
-            genQueryInp.sqlCondInp.inx = i2a;
-            genQueryInp.sqlCondInp.value = condVal;
-            genQueryInp.sqlCondInp.len = 1;
-            
-            // where attr = session_id
-            i2a[1] = COL_META_USER_ATTR_NAME;
-            // look for "openid_sess_<irodssessiontoken>
-            std::string v2;
-            v2 = "='";
-            v2 += OPENID_USER_METADATA_ATTR_PREFIX;
-            v2 += session_id;
-            v2 += "'";
-            condVal[1] = const_cast<char*>( v2.c_str() );
-            genQueryInp.sqlCondInp.len++;
-            
+/*
+            std::string w1;
+            w1 = "='";
+            w1 += username;
+            w1 += "'";
+            addInxVal( &genQueryInp.sqlCondInp, COL_USER_NAME, w1.c_str() );
+*/
+            std::string w2;
+            w2 = "='";
+            w2 += OPENID_USER_METADATA_ATTR_PREFIX;
+            w2 += session_id;
+            w2 += "'";
+            addInxVal( &genQueryInp.sqlCondInp, COL_META_USER_ATTR_NAME, w2.c_str() );
+
             genQueryInp.maxRows = 10;
             genQueryInp.continueInx = 0;
             genQueryInp.condInput.len = 0;
@@ -840,29 +834,65 @@ irods::error openid_auth_agent_request(
             int query_status = rsGenQuery( _ctx.comm(), &genQueryInp, &genQueryOut );
             if ( query_status == CAT_NO_ROWS_FOUND ) {
                 // this session id does not exist
-                return ERROR( -1, "Session id not recognized. Please re-authenticate via iinit" );
+                //return ERROR( -1, "Session id not recognized. Please re-authenticate via iinit" );
+                std::cout << "Session id not recognized, re-authenticating" << std::endl;
             }
-            if ( genQueryOut->rowCnt != 1 ) {
+            if ( genQueryOut->rowCnt > 1 ) {
                 // multiple metadata entries matched this session id, not good
                 return ERROR( -1, "Improper session state on server." );
             }
             // get the result of the query
-            char *result;
-            for ( int i = 0; i < genQueryOut->attriCnt; i++ ) {
-                //TODO
-                // not sure if this will work, because it doesn't specify a table to use, how does imeta do this?
+            //char *result;
+            char *metadata_value, *irods_user;
+            for ( int i = 0; i < genQueryOut->rowCnt; i++ ) {
+                //printf("----\n");
+                // attributes are: attr_name, attr_value, attr_units, user_name
+                metadata_value = strdup( genQueryOut->sqlResult[1].value );
+                irods_user = strdup( genQueryOut->sqlResult[3].value );
+                /*
+                for ( int j = 0; j < genQueryOut->attriCnt; j++ ) {
+                    char *q_result;
+                    q_result = genQueryOut->sqlResult[j].value;
+                    //q_result += i * genQueryOut->sqlResult[j].len;
+                    printf( "%s\n" , q_result );
+                    metadata_value = strdup( q_result );
+                }*/
             }
 
-            // ELEVATE PRIV LEVEL
-            int old_auth_flag = _ctx.comm()->clientUser.authInfo.authFlag;
-            _ctx.comm()->clientUser.authInfo.authFlag = LOCAL_PRIV_USER_AUTH;
-            //int avu_ret = rsModAVUMetadata( _ctx.comm(), &avu_inp );
-            //std::cout << "rsModAVUMetadata returned: " << avu_ret << std::endl;
-            // RESET PRIV LEVEL
-            _ctx.comm()->clientUser.authInfo.authFlag = old_auth_flag; 
-        }
-    }
+            // TODO parse metadata value, get access token+expiry
+            
+            // TODO if session valid, keep existing one and return success
+            // otherwise, fall through to the authorization steps
+            delete genQueryOut;
+            
+            // write success messages to the port
+            //write_thread
 
+
+            return SUCCESS();
+            
+        } // end got a session id/username
+        
+        std::cout << "generating authorization url" << std::endl;
+        std::string authorization_url;
+        ret = generate_authorization_url( authorization_url );
+        if ( !ret.ok() ) {
+            return ret;
+        }
+        std::unique_lock<std::mutex> lock(port_mutex);
+        port_opened = false;
+
+        std::cout << "starting write thread" << std::endl;
+        write_thread = new std::thread(open_write_to_port, _ctx.comm(), OPENID_COMM_PORT, authorization_url ); 
+        //write_thread->detach();
+        while ( !port_opened ) {
+            port_is_open_cond.wait(lock);
+            std::cout << "cond woke up" << std::endl;
+        }
+        write_thread->detach();
+
+    } // end context check
+/*
     std::cout << "generating authorization url" << std::endl;
     std::string authorization_url;
     ret = generate_authorization_url( authorization_url );
@@ -880,6 +910,7 @@ irods::error openid_auth_agent_request(
         std::cout << "cond woke up" << std::endl;
     }
     write_thread->detach();
+*/
     std::cout << "leaving openid_auth_agent_request" << std::endl;
     return SUCCESS();
 }
@@ -1465,6 +1496,7 @@ std::string *accept_request(int portno)
         }
         message->append(buf); 
     }
+    std::cout << "accepted request: " << *message << std::endl;
     close(sockfd);
     return message;
 }
