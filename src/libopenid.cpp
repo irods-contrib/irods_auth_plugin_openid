@@ -21,16 +21,15 @@
 #include "miscServerFunct.hpp"
 #include "rodsErrorTable.h"
 #include "rodsLog.h"
+#include "irods_string_tokenize.hpp"
 
 #ifdef RODS_SERVER
 #include "rsGenQuery.hpp"
 #include "rsAuthCheck.hpp"
 #include "rsAuthResponse.hpp"
 #include "rsAuthRequest.hpp"
-
-//#include "modAVUMetadata.h"
 #include "rsModAVUMetadata.hpp"
-
+#include "rsSimpleQuery.hpp"
 #endif
 
 #include <openssl/md5.h>
@@ -629,18 +628,96 @@ irods::error openid_authorize(std::string& id_token, std::string& access_token) 
     return SUCCESS();
 }
 
-irods::error get_username_by_subject_id( std::string subject_id, std::string *username ) {
-    // TODO
+irods::error get_username_by_subject_id( rsComm_t *comm, std::string subject_id, std::string *username ) {
+    rodsLog( LOG_NOTICE, "entering get_username_by_subject_id" );
+    int status;
+    genQueryInp_t genQueryInp;
+    genQueryOut_t *genQueryOut;
+    memset( &genQueryInp, 0, sizeof( genQueryInp_t ) );
+    
+    // select user_id
+    addInxIval( &genQueryInp.selectInp, COL_USER_ID, 1 );
+    addInxIval( &genQueryInp.selectInp, COL_USER_NAME, 1 );
+
+    // where user_dn (user auth name) = subject_id
+    char condition1[MAX_NAME_LEN];
+    memset( condition1, 0, MAX_NAME_LEN );
+    snprintf( condition1, MAX_NAME_LEN, "='%s'", subject_id.c_str() );
+    addInxVal( &genQueryInp.sqlCondInp, COL_USER_DN, condition1 );
+    
+    genQueryInp.maxRows = 2;
+    // ELEVATE PRIV LEVEL
+    //int old_auth_flag = comm->clientUser.authInfo.authFlag;
+    //comm->clientUser.authInfo.authFlag = LOCAL_PRIV_USER_AUTH;
+    status = rsGenQuery( comm, &genQueryInp, &genQueryOut );
+    // RESET PRIV LEVEL
+    //comm->clientUser.authInfo.authFlag = old_auth_flag;
+    
+    if ( status == CAT_NO_ROWS_FOUND || genQueryOut == NULL ) {
+        std::stringstream err_stream;
+        err_stream << "No results from rsGenQuery: " << status;
+        return ERROR( status, err_stream.str() );
+    }
+    if ( genQueryOut->rowCnt > 1 ) {
+        std::stringstream err_stream;
+        err_stream << "More than one user has the given subject_id: " << subject_id;
+        return ERROR( -1, err_stream.str() );
+    }
+    char *id = genQueryOut->sqlResult[0].value;
+    char *name = genQueryOut->sqlResult[1].value;
+    printf( "query by subject_id returned (id,name): (%s,%s)\n", id, name );
+
     username->clear();
-    username->append("kylerferriter@gmail.com");
+    username->append( name );
+    rodsLog( LOG_NOTICE, "leaving get_username_by_subject_id" );
     return SUCCESS();
 }
 
 
-irods::error get_subject_id_by_session_id( std::string session_id, std::string *subject_id ) {
+irods::error get_subject_id_by_session_id( rsComm_t *comm, std::string session_id, std::string *subject_id ) {
     // TODO
+    int status;
+    genQueryInp_t genQueryInp;
+    genQueryOut_t *genQueryOut;
+    memset( &genQueryInp, 0, sizeof( genQueryInp_t ) );
+
+    // select
+    addInxIval( &genQueryInp.selectInp, COL_META_USER_ATTR_NAME, 0 );
+    addInxIval( &genQueryInp.selectInp, COL_META_USER_ATTR_VALUE, 0 );
+    addInxIval( &genQueryInp.selectInp, COL_USER_NAME, 0 );
+    addInxIval( &genQueryInp.selectInp, COL_USER_DN, 0 );
+
+    // where meta for user matches prefix OPENID_USER_METADATA_ATTR_PREFIX
+    std::string w1;
+    w1 = "='";
+    w1 += OPENID_USER_METADATA_ATTR_PREFIX;
+    w1 += session_id;
+    w1 += "'";
+    addInxVal( &genQueryInp.sqlCondInp, COL_META_USER_ATTR_NAME, w1.c_str() );
+
+    genQueryInp.maxRows = 2;
+
+    status = rsGenQuery( comm, &genQueryInp, &genQueryOut );
+    if ( status == CAT_NO_ROWS_FOUND || genQueryOut == NULL ) {
+        std::stringstream err_stream;
+        err_stream << "No results from rsGenQuery: " << status;
+        return ERROR( status, err_stream.str() );
+    }
+    if ( genQueryOut->rowCnt > 1 ) {
+        std::stringstream err_stream;
+        err_stream << "More than one subject id found for session_id: " << session_id;
+        return ERROR( -1, err_stream.str() );
+    }
+    char *attr_name = genQueryOut->sqlResult[0].value;
+    char *attr_value = genQueryOut->sqlResult[1].value;
+    char *user_name = genQueryOut->sqlResult[2].value;
+    char *user_subject = genQueryOut->sqlResult[3].value;
+    printf( "query by session_id returned (attribute,value,user,subject): (%s,%s,%s,%s)\n",
+                attr_name, attr_value, user_name, user_subject );
+
+    
     subject_id->clear();
-    subject_id->append("117511651669728447822");
+    subject_id->append( user_subject );
     return SUCCESS();
 }
 
@@ -792,7 +869,7 @@ void open_write_to_port( rsComm_t* comm, int portno, std::string msg, /*bool aut
         // format: imeta add -u <username> <keyname> <value>
         
         std::string user_name;
-        irods::error ret = get_username_by_subject_id( subject_id, &user_name );
+        irods::error ret = get_username_by_subject_id( comm, subject_id, &user_name );
         if ( !ret.ok() ) {
             std::cout << "error retrieving username from subject id" << std::endl;
             return;
@@ -851,9 +928,9 @@ void open_write_to_port( rsComm_t* comm, int portno, std::string msg, /*bool aut
         std::cout << "wrote " << msg_len << " bytes for msg: " << msg << std::endl;
         std::string subject_id, user_name;
         // set the subject_id from the session_id
-        get_subject_id_by_session_id( session_id, &subject_id );
+        get_subject_id_by_session_id( comm, session_id, &subject_id );
         // set the user_name from the subject_id
-        get_username_by_subject_id( subject_id, &user_name );
+        get_username_by_subject_id( comm, subject_id, &user_name );
 
         //TODO can probably still write these, would be useful for the client to know their username perhaps
         // write 2 empty messages
@@ -1129,7 +1206,7 @@ irods::error initialize_server_session( rsComm_t *comm, std::string *session_id,
     // format: imeta add -u <username> <keyname> <value>
 
     //std::string user_name;
-    irods::error ret = get_username_by_subject_id( subject_id, user_name );
+    irods::error ret = get_username_by_subject_id( comm, subject_id, user_name );
     if ( !ret.ok() ) {
         std::cout << "error retrieving username from subject id" << std::endl;
         return ERROR( -1, "error retrieving username from subject id" );
