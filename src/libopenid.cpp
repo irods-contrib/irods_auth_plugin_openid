@@ -37,7 +37,6 @@
 #include <string>
 
 ///OPENID includes
-//#include <iostream>
 #include <sstream>
 #include <map>
 #include <thread>
@@ -55,8 +54,7 @@
 #include <boost/property_tree/ptree.hpp>
 #include <boost/format.hpp>
 
-#include <openssl/bio.h>
-#include "base64.h"// TODO might not be working, losing last byte in decode
+#include "base64.h"
 ///END OPENID includes
 ///DECLARATIONS
 
@@ -110,6 +108,8 @@ irods::error openid_authorize(std::string& id_token, std::string& access_token);
 
     The server will wait for the callback request from this url.  After receiving the callback, it will read the tokens
     from the request and send the email and a session token in a 2nd and 3rd message respectively.
+
+    TODO refactor the repetitive read code
 */
 void read_from_server(std::string* user_name, std::string* session_token) {
     std::cout << "entering read_from_server" << std::endl;
@@ -299,8 +299,6 @@ irods::error openid_auth_client_start(
             }
             else {
                 std::cout << "Password file contains: " << pwBuf << std::endl;
-                //_comm->loggedIn = 1;
-                //ptr->request_result( pwBuf );
                 
                 // set the password in the context string
                 irods::kvp_map_t ctx_map;
@@ -336,7 +334,6 @@ irods::error decode_id_token(
         unsigned long decoded_len = (int)(segment.size() * (3.0/4) + 0.5);
         unsigned char decoded_buf[ decoded_len + 1 ];
         memset( decoded_buf, 0, decoded_len + 1 );
-        //std::cout << "decoding: " << segment << std::endl;
 
         // base64_decode requires data to be padded to 4 byte multiples
         short pad_n = segment.size() % 4;
@@ -421,8 +418,6 @@ irods::error openid_auth_client_request(
     else {
         if ( session_token.size() != 0 ) {
             // server returned a new session token, because existing one is not valid
-            //ptr->user_name( user_name );
-            //ptr->request_result ( session_token );
             std::cout << "writing session_token to .irodsA" << std::endl;
             int obfret = obfSavePw( 0, 0, 1, session_token.c_str() );
             std::cout << "got " << obfret << " from obfSavePw" << std::endl;
@@ -477,22 +472,6 @@ irods::error openid_auth_client_response(
 }
 
 #ifdef RODS_SERVER
-irods::error initialize_server_session( rsComm_t *comm, std::string *session_id, std::string *user_name );
-void write_session_id( int sockfd, std::string session_id ) {
-    std::cout << "entering write_session_id" << std::endl;
-    int conn_sockfd;
-    socklen_t clilen;
-    struct sockaddr_in cli_addr;
-    // wait for a client connection
-    clilen = sizeof( cli_addr );
-    conn_sockfd = accept( sockfd, (struct sockaddr*) &cli_addr, &clilen );
-    if ( conn_sockfd < 0 ) {
-        perror( "accept" );
-        return;
-    }
-    std::cout << "leaving write_session_id" << std::endl;
-}
-
 static irods::error _get_server_property(std::string key, std::string& buf) {
     try {
         buf = irods::get_server_property<std::string&>(key);
@@ -521,14 +500,6 @@ irods::error openid_auth_agent_start(
         //_ctx.comm()->auth_scheme = strdup( AUTH_OPENID_SCHEME.c_str() );
         _ctx.comm()->auth_scheme = NULL;
         
-        //std::string session_id, user_name;
-
-        //ret = initialize_server_session( _ctx.comm(), &session_id, &user_name );
-        //std::cout << "initialized server sess,user: " << session_id << "," << user_name << std::endl;
-        //int sockfd = _ctx.comm()->sock;
-
-        //write_session_id( sockfd, session_id );
-
     }
     std::cout << "leaving openid_auth_agent_start" << std::endl;
     return result;
@@ -569,7 +540,6 @@ irods::error generate_authorization_url(std::string& urlBuf) {
         % client_id
         % redirect_uri; 
         
-    //std::cout << "Waiting for OpenID provider authorization...\n" << fmt.str() << std::endl;
     urlBuf = fmt.str();
     return SUCCESS();
 }
@@ -578,6 +548,7 @@ irods::error generate_authorization_url(std::string& urlBuf) {
 irods::error openid_authorize(std::string& id_token, std::string& access_token) {
     std::cout << "entering openid_authorize" << std::endl;
     std::string provider_discovery_url = irods::get_server_property<std::string>("openid_provider_discovery_url");
+    // TODO exception/error handling use _get_server_property to standardize
     std::string client_id = irods::get_server_property<std::string>("openid_client_id");
     std::string client_secret = irods::get_server_property<std::string>("openid_client_secret");
     std::string redirect_uri = irods::get_server_property<std::string>("openid_redirect_uri");
@@ -613,11 +584,8 @@ irods::error openid_authorize(std::string& id_token, std::string& access_token) 
             id_token = response_tree.get<std::string>("id_token");
             access_token = response_tree.get<std::string>("access_token");
             std::string expires_in = response_tree.get<std::string>("expires_in");
-            //std::cout << "id_token: " << id_token << std::endl;
             // TODO validate
             // https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation
-            //std::cout << "access_token: " << access_token << std::endl;
-            //std::cout << "expires_in: " << expires_in << std::endl;
         }
         delete access_token_response;
     }
@@ -646,12 +614,7 @@ irods::error get_username_by_subject_id( rsComm_t *comm, std::string subject_id,
     addInxVal( &genQueryInp.sqlCondInp, COL_USER_DN, condition1 );
     
     genQueryInp.maxRows = 2;
-    // ELEVATE PRIV LEVEL
-    //int old_auth_flag = comm->clientUser.authInfo.authFlag;
-    //comm->clientUser.authInfo.authFlag = LOCAL_PRIV_USER_AUTH;
     status = rsGenQuery( comm, &genQueryInp, &genQueryOut );
-    // RESET PRIV LEVEL
-    //comm->clientUser.authInfo.authFlag = old_auth_flag;
     
     if ( status == CAT_NO_ROWS_FOUND || genQueryOut == NULL ) {
         std::stringstream err_stream;
@@ -675,7 +638,6 @@ irods::error get_username_by_subject_id( rsComm_t *comm, std::string subject_id,
 
 
 irods::error get_subject_id_by_session_id( rsComm_t *comm, std::string session_id, std::string *subject_id ) {
-    // TODO
     int status;
     genQueryInp_t genQueryInp;
     genQueryOut_t *genQueryOut;
@@ -921,18 +883,16 @@ void open_write_to_port( rsComm_t* comm, int portno, std::string msg, /*bool aut
         // already authorized with a session id
         int msg_len = msg.size();
         write( conn_sockfd, &msg_len, sizeof( msg_len ) );
-        //if ( msg_len > 0 ) {
-            write( conn_sockfd, msg.c_str(), msg_len );
-        //}
+        write( conn_sockfd, msg.c_str(), msg_len );
         std::cout << "wrote " << msg_len << " bytes for msg: " << msg << std::endl;
         std::string subject_id, user_name;
+        
         // set the subject_id from the session_id
         get_subject_id_by_session_id( comm, session_id, &subject_id );
         // set the user_name from the subject_id
         get_username_by_subject_id( comm, subject_id, &user_name );
 
-        //TODO can probably still write these, would be useful for the client to know their username perhaps
-        // write 2 empty messages
+        // write back user_name and session token even though client should know them
         //std::string empty_msg;
         msg_len = user_name.size();
         write( conn_sockfd, &msg_len, sizeof( msg_len ) );
@@ -951,48 +911,6 @@ void open_write_to_port( rsComm_t* comm, int portno, std::string msg, /*bool aut
     // done writing, reset thread pointer;
     delete write_thread;
     write_thread = NULL;
-}
-
-void write_url_to_port( int portno, std::string msg ) {
-    std::unique_lock<std::mutex> lock(port_mutex);
-    //std::unique_lock<std::mutex> lock(port_mutex);
-
-    std::cout << "entering open_write_to_port" << std::endl;
-    int sockfd, conn_sockfd;
-    socklen_t clilen;
-    struct sockaddr_in serv_addr, cli_addr;
-    sockfd = socket( AF_INET, SOCK_STREAM, 0 );
-    if ( sockfd < 0 ) {
-        perror( "socket" );
-        return;
-    }
-    memset( &serv_addr, 0, sizeof( serv_addr ) );
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_addr.s_addr = INADDR_ANY;
-    serv_addr.sin_port = htons( portno );
-    if ( bind( sockfd, (struct sockaddr*) &serv_addr, sizeof( serv_addr ) ) < 0 ) {
-        perror( "bind" );
-        return;
-    }
-    listen( sockfd, 1 );
-
-    // notify that port is open so that main thread can continue and return
-    std::cout << "notifying port_is_open_cond" << std::endl;
-    port_opened = true;
-    lock.unlock();
-    port_is_open_cond.notify_all();
-
-    // wait for a client connection
-    clilen = sizeof( cli_addr );
-    conn_sockfd = accept( sockfd, (struct sockaddr*) &cli_addr, &clilen );
-    if ( conn_sockfd < 0 ) {
-        perror( "accept" );
-        return;
-    }
-    int msg_len = msg.size();
-    write( conn_sockfd, &msg_len, sizeof( msg_len ) );
-    write( conn_sockfd, msg.c_str(), msg_len );
-    return;
 }
 
 
@@ -1115,7 +1033,6 @@ irods::error openid_auth_agent_request(
 
         std::cout << "starting write thread" << std::endl;
         write_thread = new std::thread( open_write_to_port, _ctx.comm(), OPENID_COMM_PORT, write_msg, session_id ); 
-        //write_thread = new std::thread( write_url_to_port, OPENID_COMM_PORT, write_msg );
         while ( !port_opened ) {
             port_is_open_cond.wait(lock);
             std::cout << "cond woke up" << std::endl;
@@ -1128,259 +1045,6 @@ irods::error openid_auth_agent_request(
     return SUCCESS();
 }
 
-irods::error initialize_server_session( rsComm_t *comm, std::string *session_id, std::string *user_name ) {
-    std::cout << "entering initialize_server_session" << std::endl;
-    // TODO check/verify timeout on openid_authorize function
-    std::string id_token_base64;
-    std::string access_token;
-    openid_authorize( id_token_base64, access_token );
-    std::cout << "returned from authorize" << std::endl;
-
-    // base64 decode the id_token to get profile info from it (name, email)
-    std::string header, body;
-    decode_id_token( id_token_base64, &header, &body );
-    std::cout << "decoded id_token: " << body << std::endl;
-
-    // this is too long to store as the password (session token), so create one for use in irods,
-    // which will map as they key to the actual id/access token.
-    // Max irods password is 50bytes, SHA-1 is 20, base64(sha-1) is 27 bytes (28 with pad)
-    char irods_session_token[MAX_PASSWORD_LEN + 1];
-    memset( irods_session_token, 0, MAX_PASSWORD_LEN + 1 );
-    unsigned long base64_sha1_len = (int)( 20 * 4/3 + 1);
-    // include room for pad
-    if ( base64_sha1_len % 4 != 0 ) {
-        base64_sha1_len += 4 - ( base64_sha1_len % 4 );
-    }
-    // include room for null terminator
-    base64_sha1_len += 1;
-
-    char sha1_buf[ 21 ];
-    memset( sha1_buf, 0, 21 );
-    char base64_sha1_buf[ base64_sha1_len ];
-    memset( base64_sha1_buf, 0, base64_sha1_len );
-
-    // access_token is unique per OIDC authentication so use in in sess id
-    obfMakeOneWayHash(
-        HASH_TYPE_SHA1,
-        (const unsigned char*) access_token.c_str(),
-        access_token.size(),
-        (unsigned char*) sha1_buf );
-    std::cout << "sha1 token: ";
-    for ( int i = 0; i < 20; i++ ) {
-        printf( "%02X", (unsigned char)sha1_buf[i] );
-    }
-    std::cout << std::endl;
-
-    int encret = base64_encode(
-        (const unsigned char*) sha1_buf,
-        20,
-        (unsigned char*) base64_sha1_buf,
-        &base64_sha1_len);
-    std::cout << "base64_encode returned: " << encret << std::endl;
-    std::cout << "base64 encoded: ";
-    for ( unsigned long i = 0; i < base64_sha1_len; i++ ) {
-        printf( "%c", base64_sha1_buf[i] );
-    }
-    std::cout << std::endl;
-
-    strncpy( irods_session_token, base64_sha1_buf, base64_sha1_len );
-    std::cout << "created session token: " << irods_session_token << std::endl;
-    // get Subject from the id_token decoded body
-    boost::property_tree::ptree body_tree;
-    std::stringstream body_stream( body );
-    boost::property_tree::read_json( body_stream, body_tree );
-    std::string subject_id;
-    if ( body_tree.find( "sub" ) == body_tree.not_found() ) {
-        std::cout << "Subject ID not in the response returned by OIDC Provider" << std::endl;
-        //close( conn_sockfd );
-        //close( sockfd );
-        std::cout << "leaving " << std::endl;
-        return ERROR( -1, "Subject field missing from OIDC Provider response" );
-        //return;
-    }
-    subject_id = body_tree.get<std::string>( "sub" );
-    std::cout << "subject id: " << subject_id << std::endl;
-    // put session token in the server database
-    // user attribute: lib/api/include/modAVUMetadata.h
-    // format: imeta add -u <username> <keyname> <value>
-
-    //std::string user_name;
-    irods::error ret = get_username_by_subject_id( comm, subject_id, user_name );
-    if ( !ret.ok() ) {
-        std::cout << "error retrieving username from subject id" << std::endl;
-        return ERROR( -1, "error retrieving username from subject id" );
-    }
-
-    // plugins/database/src/db_plugin.cpp:9320 actual call
-    modAVUMetadataInp_t avu_inp;
-    memset( &avu_inp, 0, sizeof( avu_inp ) );
-    std::string operation("add");
-    std::string obj_type("-u");
-    avu_inp.arg0 = (char*)operation.c_str(); // operation
-    avu_inp.arg1 = (char*)obj_type.c_str(); // obj type
-    avu_inp.arg2 = (char*)user_name->c_str(); // username
-
-    size_t prefix_len = strlen( OPENID_USER_METADATA_ATTR_PREFIX );
-    char metadata_key[ prefix_len + MAX_PASSWORD_LEN ];
-    memset( metadata_key, 0, prefix_len + MAX_PASSWORD_LEN );
-    strncpy( metadata_key, OPENID_USER_METADATA_ATTR_PREFIX, prefix_len );
-    strncpy( metadata_key + prefix_len, irods_session_token, strlen( irods_session_token ) );
-    avu_inp.arg3 = metadata_key; // key
-
-    // will need to jam more info in here, like expiry
-    avu_inp.arg4 = (char*)access_token.c_str(); // value
-    std::stringstream meta_val;
-    //meta_val <<
-    std::string expiry = "9999-12-31 12:00:00+00:00";
-
-    // ELEVATE PRIV LEVEL
-    int old_auth_flag = comm->clientUser.authInfo.authFlag;
-    comm->clientUser.authInfo.authFlag = LOCAL_PRIV_USER_AUTH;
-    int avu_ret = rsModAVUMetadata( comm, &avu_inp );
-    std::cout << "rsModAVUMetadata returned: " << avu_ret << std::endl;
-    // RESET PRIV LEVEL
-    comm->clientUser.authInfo.authFlag = old_auth_flag;
-
-    session_id->clear();
-    session_id->append( irods_session_token );
-    //user_name->clear();
-    //user_name->append( user_name );
-
-    std::cout << "leaving initialize_server_session" << std::endl;
-    return SUCCESS();
-}
-
-irods::error openid_auth_agent_response2(
-    irods::plugin_context& _ctx,
-    authResponseInp_t* _resp ) {
-    std::cout << "entering openid_auth_agent_response" << std::endl;
-    irods::error result = SUCCESS();
-    irods::error ret;
-    std::cout << "inp username: " << _resp->username << std::endl;
-    std::cout << "inp response: " << _resp->response << std::endl;
-
-    ret = _ctx.valid<irods::generic_auth_object>();
-    if ( ( result = ASSERT_PASS( ret, "Invalid plugin context." ) ).ok() ) {
-        int status;
-        authCheckInp_t authCheckInp;
-        authCheckOut_t *authCheckOut = NULL;
-        rodsServerHost_t *rodsServerHost;
-        char *bufp;
-
-        bufp = _rsAuthRequestGetChallenge();
-
-        status = getAndConnRcatHostNoLogin( _ctx.comm(), MASTER_RCAT,
-                                            _ctx.comm()->clientUser.rodsZone, &rodsServerHost );
-        if ( ( result = ASSERT_ERROR( status >= 0, status, "Connecting to rcat host failed" ) ).ok() ) {
-            memset( &authCheckInp, 0, sizeof( authCheckInp ) );
-            authCheckInp.challenge = bufp;
-            authCheckInp.response = _resp->response;
-            authCheckInp.username = _resp->username;
-            if ( rodsServerHost->localFlag == LOCAL_HOST ) {
-                status = rsAuthCheck( _ctx.comm(), &authCheckInp, &authCheckOut );
-            }
-            else {
-                status = rcAuthCheck( rodsServerHost->conn, &authCheckInp, &authCheckOut );
-                rcDisconnect( rodsServerHost->conn );
-                rodsServerHost->conn = NULL;
-            }
-            if ( ( result = ASSERT_ERROR( status >= 0 && authCheckOut != NULL, status, "rcAuthCheck failed, status = %d.",
-                                          status ) ).ok() ) { // JMC cppcheck
-                /*
-                if ( rodsServerHost->localFlag != LOCAL_HOST ) {
-                    if ( authCheckOut->serverResponse == NULL ) {
-                        rodsLog( LOG_NOTICE, "Warning, cannot authenticate remote server, no serverResponse field" );
-                        result = ASSERT_ERROR( !requireServerAuth, REMOTE_SERVER_AUTH_NOT_PROVIDED, "Authentication disallowed. no serverResponse field." );
-                    }
-                    else {
-                        char *cp;
-                        int OK, len, i;
-                        if ( *authCheckOut->serverResponse == '\0' ) {
-                            rodsLog( LOG_NOTICE, "Warning, cannot authenticate remote server, serverResponse field is empty" );
-                            result = ASSERT_ERROR( !requireServerAuth, REMOTE_SERVER_AUTH_EMPTY, "Authentication disallowed, empty serverResponse." );
-                        }
-                        else {
-                            char username2[NAME_LEN + 2];
-                            char userZone[NAME_LEN + 2];
-                            memset( md5Buf, 0, sizeof( md5Buf ) );
-                            strncpy( md5Buf, authCheckInp.challenge, CHALLENGE_LEN );
-                            parseUserName( _resp->username, username2, userZone );
-                            getZoneServerId( userZone, serverId );
-                            len = strlen( serverId );
-                            if ( len <= 0 ) {
-                                rodsLog( LOG_NOTICE, "rsAuthResponse: Warning, cannot authenticate the remote server, no RemoteZoneSID defined in server.config", status );
-                                result = ASSERT_ERROR( !requireServerAuth, REMOTE_SERVER_SID_NOT_DEFINED, "Authentication disallowed, no RemoteZoneSID defined." );
-                            }
-                            else {
-                                strncpy( md5Buf + CHALLENGE_LEN, serverId, len );
-                                MD5_Init( &context );
-                                MD5_Update( &context, ( unsigned char* )md5Buf, CHALLENGE_LEN + MAX_PASSWORD_LEN );
-                                MD5_Final( ( unsigned char* )digest, &context );
-                                for ( i = 0; i < RESPONSE_LEN; i++ ) {
-                                    if ( digest[i] == '\0' ) {
-                                        digest[i]++;
-                                    }  // make sure 'string' doesn't end early
-                                }
-                                cp = authCheckOut->serverResponse;
-                                OK = 1;
-                                for ( i = 0; i < RESPONSE_LEN; i++ ) {
-                                    if ( *cp++ != digest[i] ) {
-                                        OK = 0;
-                                    }
-                                }
-                                rodsLog( LOG_DEBUG, "serverResponse is OK/Not: %d", OK );
-                                result = ASSERT_ERROR( OK != 0, REMOTE_SERVER_AUTHENTICATION_FAILURE, "Authentication disallowed, server response incorrect." );
-                            }
-                        }
-                    }
-                }*/
-
-                /* Set the clientUser zone if it is null. */
-                if ( result.ok() && strlen( _ctx.comm()->clientUser.rodsZone ) == 0 ) {
-                    zoneInfo_t *tmpZoneInfo;
-                    status = getLocalZoneInfo( &tmpZoneInfo );
-                    if ( ( result = ASSERT_ERROR( status >= 0, status, "getLocalZoneInfo failed." ) ).ok() ) {
-                        strncpy( _ctx.comm()->clientUser.rodsZone, tmpZoneInfo->zoneName, NAME_LEN );
-                    }
-                }
-
-                /* have to modify privLevel if the icat is a foreign icat because
-                 * a local user in a foreign zone is not a local user in this zone
-                 * and vice versa for a remote user
-                 */
-                if ( result.ok() && rodsServerHost->rcatEnabled == REMOTE_ICAT ) {
-
-                    /* proxy is easy because rodsServerHost is based on proxy user */
-                    if ( authCheckOut->privLevel == LOCAL_PRIV_USER_AUTH ) {
-                        authCheckOut->privLevel = REMOTE_PRIV_USER_AUTH;
-                    }
-                    else if ( authCheckOut->privLevel == LOCAL_USER_AUTH ) {
-                        authCheckOut->privLevel = REMOTE_USER_AUTH;
-                    }
-
-                    /* adjust client user */
-                    authCheckOut->clientPrivLevel = authCheckOut->privLevel;
-                }
-                
-                authCheckOut->clientPrivLevel = authCheckOut->privLevel;
-                if ( result.ok() ) {
-                    _ctx.comm()->clientUser.authInfo.authFlag = authCheckOut->privLevel;
-                }
-            }
-        }
-        if ( authCheckOut != NULL ) {
-            if ( authCheckOut->serverResponse != NULL ) {
-                free( authCheckOut->serverResponse );
-            }
-
-            free( authCheckOut );
-        }
-
-    }
-
-    std::cout << "leaving openid_auth_agent_response" << std::endl;
-    return result;
-}
 
 static
 int check_proxy_user_privileges(
@@ -1948,11 +1612,13 @@ std::string *curl_post(std::string url, std::string *fields)
         curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, fields->length());
         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, fields->c_str());
 
-        std::cout << "Performing curl" << std::endl;
+        std::cout << "Performing curl POST:" << url << std::endl;
         res = curl_easy_perform(curl);
         if (res != CURLE_OK)
         {
             fprintf(stderr, "curl_easy_perform() failed %s\n", curl_easy_strerror(res));
+            delete response;
+            return NULL;
         }
         curl_easy_cleanup(curl);
     }
@@ -1970,14 +1636,16 @@ std::string *curl_get(std::string url, std::string *params)
     std::string *response = new std::string();
     if (curl)
     {
-        std::cout << "CURLOPT_URL: " << url.c_str() << std::endl;
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, _curl_writefunction_callback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, response);
+        std::cout << "Performing curl GET: " << url << std::endl;
         res = curl_easy_perform(curl);
         if (res != CURLE_OK)
         {
             fprintf(stderr, "curl_easy_perform() failed %s\n", curl_easy_strerror(res));
+            delete response;
+            return NULL;
         }
         curl_easy_cleanup(curl);
     }
@@ -1988,7 +1656,7 @@ std::string *curl_get(std::string url, std::string *params)
 std::string *accept_request(int portno)
 {
     std::cout << "accepting request on port " << portno << std::endl;
-    int sockfd;
+    int sockfd, ret;
     struct sockaddr_in server_address;
     struct sockaddr_in client_address;
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -1997,7 +1665,13 @@ std::string *accept_request(int portno)
     server_address.sin_family = AF_INET;
     server_address.sin_addr.s_addr = htonl(INADDR_ANY);
     server_address.sin_port = htons(portno);
-    bind(sockfd, (struct sockaddr *)&server_address, sizeof(server_address));
+    ret = bind(sockfd, (struct sockaddr *)&server_address, sizeof(server_address));
+    if ( ret < 0 ) {
+        std::stringstream err_stream;
+        err_stream << "binding to port " << portno << " failed: ";
+        perror( err_stream.str().c_str()  );
+        return NULL;
+    }
     listen(sockfd, 1);
     std::string *message = new std::string("");
     
@@ -2007,7 +1681,7 @@ std::string *accept_request(int portno)
     const size_t BUF_LEN = 2048;
     char buf[BUF_LEN+1]; buf[BUF_LEN] = 0x0;
     struct timeval timeout;
-    timeout.tv_sec = 5;
+    timeout.tv_sec = 5; // after accepting connection, will terminate if no data sent for 5 sec
     timeout.tv_usec = 0;
     setsockopt(conn_sock_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
