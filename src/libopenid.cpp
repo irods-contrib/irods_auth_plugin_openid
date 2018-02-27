@@ -53,7 +53,8 @@
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
 #include <boost/format.hpp>
-
+#include "irods_hasher_factory.hpp"
+#include "SHA256Strategy.hpp"
 #include "base64.h"
 ///END OPENID includes
 ///DECLARATIONS
@@ -104,6 +105,56 @@ std::string *curl_get(std::string url, std::string *fields);
 #define OPENID_USER_METADATA_SESSION_PREFIX "openid_sess_"
 #define OPENID_USER_METADATA_REFRESH_TOKEN_KEY "openid_refresh_token"
 
+
+/*
+    Reads bytes from a socket and puts them in msg_out.
+
+    Expects message to be formatted as byte sequences of length: [4][len] 
+    The first four bytes being the length of the message, followed by the message.
+*/
+int read_msg( int sockfd, std::string& msg_out )
+{
+    const int READ_LEN = 256;
+    char buffer[READ_LEN + 1];
+    memset( buffer, 0, READ_LEN + 1 );
+    int n_bytes = 0;
+    int data_len = 0;
+    int total_bytes = 0;
+    read( sockfd, &data_len, sizeof( data_len ) );
+    memset( buffer, 0, READ_LEN );
+    std::string msg;
+    // read that many bytes into our buffer, which contains the Authorization url
+    while ( total_bytes < data_len ) {
+        int bytes_remaining = data_len - total_bytes;
+        if ( bytes_remaining < READ_LEN ) {
+            // can read rest of data in one go
+            n_bytes = read( sockfd, buffer, bytes_remaining );
+        }
+        else {
+            // read max bytes into buffer
+            n_bytes = read( sockfd, buffer, READ_LEN );
+        }
+        if ( n_bytes == -1 ) {
+            // error reading
+            break;
+        }
+        if ( n_bytes == 0 ) {
+            // no more data
+            break;
+        }
+        //std::cout << "received " << n_bytes << " bytes: " << buffer << std::endl;
+        //for ( int i = 0; i < n_bytes; i++ ) {
+        //    printf( "%02X", buffer[i] );
+        //}
+        //printf( "\n" );
+        msg.append( buffer );
+        total_bytes += n_bytes;
+        memset( buffer, 0, READ_LEN );
+    }
+    msg_out = msg;
+    return 0;
+}
+
 /*
     Opens a socket connection to the irods_host set in ~/.irods/irods_environment.json
     on port OPENID_COMM_PORT.  Reads two messages. Messages start with 4 bytes specifying the length,
@@ -117,15 +168,15 @@ std::string *curl_get(std::string url, std::string *fields);
 
     TODO refactor the repetitive read code
 */
-void read_from_server( int portno, std::string* user_name, std::string* session_token )
+void read_from_server( int portno, std::string nonce /*TODO*/,std::string& user_name, std::string& session_token )
 {
     std::cout << "entering read_from_server" << std::endl;
-    int sockfd, n_bytes;
+    int sockfd;
     struct sockaddr_in serv_addr;
     struct hostent* server;
-    const int READ_LEN = 256;
-    char buffer[READ_LEN + 1];
-    memset( buffer, 0, READ_LEN + 1 );
+    //const int READ_LEN = 256;
+    //char buffer[READ_LEN + 1];
+    //memset( buffer, 0, READ_LEN + 1 );
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if ( sockfd < 0 ) {
         perror( "socket" );
@@ -145,12 +196,22 @@ void read_from_server( int portno, std::string* user_name, std::string* session_
         perror( "connect" );
         return;
     }
-    int data_len = 0;
-    int total_bytes = 0;
+    //int data_len = 0;
+    //int total_bytes = 0;
+    
+    // write nonce to server to verify that we are the same client that the auth req came from
+    int msg_len = nonce.size();
+    write( sockfd, &msg_len, sizeof( msg_len ) );
+    write( sockfd, nonce.c_str(), msg_len );
 
     // read first 4 bytes (data length)
     std::string authorization_url_buf;
-    read( sockfd, &data_len, sizeof( data_len ) );
+    if ( read_msg( sockfd, authorization_url_buf ) < 0 ) {
+        perror( "error reading url from socket" );
+        return;
+    }
+
+    /*read( sockfd, &data_len, sizeof( data_len ) );
     memset( buffer, 0, READ_LEN );
     // read that many bytes into our buffer, which contains the Authorization url
     while ( total_bytes < data_len ) {
@@ -179,7 +240,7 @@ void read_from_server( int portno, std::string* user_name, std::string* session_
         authorization_url_buf.append( buffer );
         total_bytes += n_bytes;
         memset( buffer, 0, READ_LEN );
-    }
+    }*/
     // finished reading authorization url
     // if the auth url is "true", session is already authorized, no user action needed
     // TODO find better way to signal a valid session, debug issue with using empty message as url
@@ -191,6 +252,11 @@ void read_from_server( int portno, std::string* user_name, std::string* session_
     }
 
     // wait for username message now
+    if ( read_msg( sockfd, user_name ) < 0 ) {
+        perror( "error reading username from server" );
+        return;
+    }
+    /*
     read( sockfd, &data_len, sizeof( data_len ) );
     total_bytes = 0;
     memset( buffer, 0, READ_LEN );
@@ -221,9 +287,15 @@ void read_from_server( int portno, std::string* user_name, std::string* session_
         total_bytes += n_bytes;
         memset( buffer, 0, READ_LEN );
     } // finished reading username string from server
-    std::cout << "read user_name: " << *user_name << std::endl;
+    */
+    std::cout << "read user_name: " << user_name << std::endl;
 
     // wait for session token now
+    if ( read_msg( sockfd, session_token ) < 0 ) {
+        perror( "error reading session token from server" );
+        return;
+    }
+    /*
     read( sockfd, &data_len, sizeof( data_len ) );
     total_bytes = 0;
     memset( buffer, 0, READ_LEN );
@@ -254,7 +326,8 @@ void read_from_server( int portno, std::string* user_name, std::string* session_
         total_bytes += n_bytes;
         memset( buffer, 0, READ_LEN );
     } // finished reading session from server
-    std::cout << "read session token: " << *session_token << std::endl;
+    */
+    std::cout << "read session token: " << session_token << std::endl;
 
     close( sockfd );
     std::cout << "leaving read_from_server" << std::endl;
@@ -444,16 +517,16 @@ irods::error openid_auth_client_request(
     irods::kvp_map_t out_map;
     irods::parse_escaped_kvp_string( req_out->result_, out_map );
     int portno = std::stoi( out_map["port"] );
+    std::string nonce = out_map["nonce"]; // 
     std::cout << "received port from server: " << portno << std::endl;
+    std::cout << "received nonce from server: " << nonce << std::endl;
 
     // perform authorization handshake with server 
     // server performs authorization, waits for client to authorize via url it returns via socket
     // when client authorizes, server requests a token from OIDC provider and returns email+session token
     std::string user_name, session_token;
     std::cout << "attempting to read username and session token from server" << std::endl;
-    read_from_server( portno, &user_name, &session_token );
-    //std::cout << "received username: " << user_name << std::endl;
-    //std::cout << "received session_token: " << session_token << std::endl;
+    read_from_server( portno, nonce, user_name, session_token );
     ptr->user_name( user_name );
 
     // handle errors and exit
@@ -1099,16 +1172,37 @@ int bind_port( int *portno, int *sock_out )
 }
 
 /*
-    Uses plugin connection to connect to database. Portno is the server port that the client needs to connect to.
+    Generates a random alphanumeric string of length len, and puts it in buf_out, overwriting any prior contents.
+*/
+int generate_nonce( size_t len, std::string& buf_out )
+{
+    srandom( time( NULL ) );
+    std::string arr = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    size_t arr_len = arr.size();
+    char buf[ len ];
+    for ( size_t i = 0; i < len; i++ ) {
+        buf[ i ] = arr[ random() % arr_len ];
+    }
+    buf_out.clear();
+    buf_out.append( buf, len );
 
-    msg: message to send to client first. On auth without valid session, this is the authorization url.  If empty string,
-        client will interpret as their session already being valid.
-    authorized: if true, will not wait for a callback request to be received. Will just send back an empty url, followed
-        by the username and session id.
+    std::cout << "generated nonce: " << buf_out << std::endl;
+    return 0;
+}
+
+/*
+    Uses plugin connection to connect to database. Portno is the server port that the client needs to connect to.
+    
+    portno: pointer to an integer. used in the call to bind_port. If value it points to is 0, will bind to OS assigned port
+        and set the value of portno so caller can see the value. Otherwise, it will attempt to bind to that port number.
+    nonce: will generate a nonce and set this to be that value. The client must send this to the server as the first message
+        when it connects to the port. The server will check for this message and terminate the connection if not present.
+    msg: message to send to client first. On auth without valid session, this is the authorization url.  If the string
+        "true", client will interpret it as meaning the user does not need to re-authenticate via Identity Provider.
     session_id: if emtpy, will wait for an authorization callback to generate a session id. If not empty, will use it as the
         session id and send it back to client.
 */
-void open_write_to_port( rsComm_t* comm, int *portno, std::string msg, /*bool authorized,*/ std::string session_id)
+void open_write_to_port( rsComm_t* comm, int *portno, std::string *nonce, std::string msg, /*bool authorized,*/ std::string session_id)
 {
     std::unique_lock<std::mutex> lock(port_mutex);
     //std::unique_lock<std::mutex> lock(port_mutex);
@@ -1139,14 +1233,20 @@ void open_write_to_port( rsComm_t* comm, int *portno, std::string msg, /*bool au
     }
     listen( sockfd, 1 );
     */
-    
+   
+    int ret;
+    ret = generate_nonce( 32, *nonce );
+    if ( ret < 0 ) {
+        perror( "error generating nonce" );
+        return;
+    }
     //////////////
     int sockfd, conn_sockfd;
     socklen_t clilen;
     struct sockaddr_in cli_addr;
     clilen = sizeof( cli_addr );
 
-    int ret = bind_port( portno, &sockfd );
+    ret = bind_port( portno, &sockfd );
     if ( ret < 0 ) {
         perror( "error binding to port" );
         return;
@@ -1167,6 +1267,21 @@ void open_write_to_port( rsComm_t* comm, int *portno, std::string msg, /*bool au
         close( sockfd );
         return;
     }
+    
+    // verify client nonce
+    std::string client_nonce;
+    if ( read_msg( conn_sockfd, client_nonce ) < 0 ) {
+        perror( "error reading nonce from client" );
+        return;
+    }
+    std::cout << "received nonce from client: " << client_nonce << std::endl;
+    
+    if ( nonce->compare( client_nonce ) != 0 ) {
+        rodsLog( LOG_WARNING, "Received connection on port %d from client who provided incorrect nonce. Expected [%s] but got [%s]",
+                                *portno, nonce->c_str(), client_nonce.c_str() );
+    }
+
+
 
     if ( session_id.empty() ) {
         std::cout << "starting write for empty session_id" << std::endl;
@@ -1536,8 +1651,8 @@ irods::error openid_auth_agent_request(
         
         rodsLog( LOG_NOTICE, "Starting write thread" );
         int portno = 0;
-        //write_thread = new std::thread( open_write_to_port, _ctx.comm(), OPENID_COMM_PORT, write_msg, session_id ); 
-        write_thread = new std::thread( open_write_to_port, _ctx.comm(), &portno, write_msg, session_id ); 
+        std::string nonce;
+        write_thread = new std::thread( open_write_to_port, _ctx.comm(), &portno, &nonce, write_msg, session_id ); 
         while ( !port_opened ) {
             port_is_open_cond.wait(lock);
             std::cout << "cond woke up" << std::endl;
@@ -1546,6 +1661,7 @@ irods::error openid_auth_agent_request(
         irods::kvp_map_t return_map;
         std::string port_str = std::to_string( portno );
         return_map["port"] = port_str;
+        return_map["nonce"] = nonce;
         ptr->request_result( irods::escaped_kvp_string( return_map ) );
         write_thread->detach();
 
