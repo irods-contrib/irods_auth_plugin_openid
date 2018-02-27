@@ -117,7 +117,8 @@ std::string *curl_get(std::string url, std::string *fields);
 
     TODO refactor the repetitive read code
 */
-void read_from_server(std::string* user_name, std::string* session_token) {
+void read_from_server( int portno, std::string* user_name, std::string* session_token )
+{
     std::cout << "entering read_from_server" << std::endl;
     int sockfd, n_bytes;
     struct sockaddr_in serv_addr;
@@ -139,7 +140,7 @@ void read_from_server(std::string* user_name, std::string* session_token) {
     memset( &serv_addr, 0, sizeof( serv_addr ) );
     serv_addr.sin_family = AF_INET;
     memcpy( server->h_addr, &serv_addr.sin_addr.s_addr, server->h_length );
-    serv_addr.sin_port = htons( OPENID_COMM_PORT );
+    serv_addr.sin_port = htons( portno );
     if ( connect( sockfd, (struct sockaddr*)&serv_addr, sizeof( serv_addr ) ) < 0 ) {
         perror( "connect" );
         return;
@@ -440,14 +441,19 @@ irods::error openid_auth_client_request(
     std::cout << "calling rcAuthPluginRequest" << std::endl;
     int status = rcAuthPluginRequest( _comm, &req_in, &req_out );
     
+    irods::kvp_map_t out_map;
+    irods::parse_escaped_kvp_string( req_out->result_, out_map );
+    int portno = std::stoi( out_map["port"] );
+    std::cout << "received port from server: " << portno << std::endl;
+
     // perform authorization handshake with server 
     // server performs authorization, waits for client to authorize via url it returns via socket
     // when client authorizes, server requests a token from OIDC provider and returns email+session token
     std::string user_name, session_token;
     std::cout << "attempting to read username and session token from server" << std::endl;
-    read_from_server( &user_name, &session_token );
-    std::cout << "received username: " << user_name << std::endl;
-    std::cout << "received session_token: " << session_token << std::endl;
+    read_from_server( portno, &user_name, &session_token );
+    //std::cout << "received username: " << user_name << std::endl;
+    //std::cout << "received session_token: " << session_token << std::endl;
     ptr->user_name( user_name );
 
     // handle errors and exit
@@ -455,7 +461,15 @@ irods::error openid_auth_client_request(
         return ERROR( status, "call to rcAuthPluginRequest failed." );
     }
     else {
-        if ( session_token.size() != 0 ) {
+        // check if session received is different from session sent
+        irods::kvp_map_t context_map;
+        ret = irods::parse_escaped_kvp_string( context, context_map );
+        if ( !ret.ok() ) {
+            rodsLog( LOG_ERROR, "Could not parse context string" );
+            return ERROR( -1, "unable to parse context string after rcAuthPluginRequest" );
+        }
+        std::string original_sess = context_map[ irods::AUTH_PASSWORD_KEY ];
+        if ( session_token.size() != 0 && session_token.compare( original_sess ) != 0 ) {
             // server returned a new session token, because existing one is not valid
             std::cout << "writing session_token to .irodsA" << std::endl;
             int obfret = obfSavePw( 0, 0, 1, session_token.c_str() );
@@ -1020,8 +1034,8 @@ irods::error refresh_access_token( std::string& access_token, std::string& expir
     snprintf( time_buf, 50, "%ld", ( now + expires_in ) );
     expiry.assign( time_buf );
     
-    rodsLog( LOG_NOTICE, "Successfully refreshed access token %s with (access_token, refresh_token, expiry): (%s,%s,%s)",
-                            old_acc_tok.c_str(), access_token.c_str(), refresh_token.c_str(), expiry.c_str() );
+    rodsLog( LOG_NOTICE, "Successfully refreshed access token %s with (access_token, expiry): (%s,%s)",
+                            old_acc_tok.c_str(), access_token.c_str(), expiry.c_str() );
     return SUCCESS();
 }
 
@@ -1036,6 +1050,55 @@ bool port_opened = false;
 /**/
 
 /*
+    Bind to port portno and return the server socket in sock_out. If portno is 0, bind to random port and
+    also update the value of portno to have that port number.
+
+    On error return negative. On success return 0.
+*/
+int bind_port( int *portno, int *sock_out )
+{
+    int sockfd;
+    struct sockaddr_in serv_addr;
+    sockfd = socket( AF_INET, SOCK_STREAM, 0 );
+    if ( sockfd < 0 ) {
+        perror( "socket" );
+        return sockfd;
+    }
+    int opt_val = 1;
+    setsockopt( sockfd, SOL_SOCKET, SO_REUSEADDR, (const void*)&opt_val, sizeof( opt_val ) );
+    memset( &serv_addr, 0, sizeof( serv_addr ) );
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_addr.s_addr = INADDR_ANY;
+    serv_addr.sin_port = htons( *portno );
+    int ret;
+    ret = bind( sockfd, (struct sockaddr*)&serv_addr, sizeof( serv_addr ) );
+    if ( ret < 0 ) {
+        std::stringstream err_stream( "error binding socket to port: " );
+        err_stream << *portno;
+        perror( err_stream.str().c_str() );
+        close( sockfd );
+        return ret;
+    }
+    listen( sockfd, 1 );
+
+    // check random port assignment
+    if ( *portno == 0 ) {
+        socklen_t socklen = sizeof( serv_addr );
+        ret = getsockname( sockfd, (struct sockaddr*)&serv_addr, &socklen );
+        if ( ret < 0 ) {
+            close( sockfd );
+            perror( "error looking up socket for OS assigned port" );
+            return ret;
+        }
+        int assigned_port = ntohs( serv_addr.sin_port );
+        std::cout << "assigned port: " << assigned_port << std::endl;
+        *portno = assigned_port;
+    }
+    *sock_out = sockfd;
+    return 0;
+}
+
+/*
     Uses plugin connection to connect to database. Portno is the server port that the client needs to connect to.
 
     msg: message to send to client first. On auth without valid session, this is the authorization url.  If empty string,
@@ -1045,13 +1108,13 @@ bool port_opened = false;
     session_id: if emtpy, will wait for an authorization callback to generate a session id. If not empty, will use it as the
         session id and send it back to client.
 */
-
-void open_write_to_port( rsComm_t* comm, int portno, std::string msg, /*bool authorized,*/ std::string session_id) {
+void open_write_to_port( rsComm_t* comm, int *portno, std::string msg, /*bool authorized,*/ std::string session_id)
+{
     std::unique_lock<std::mutex> lock(port_mutex);
     //std::unique_lock<std::mutex> lock(port_mutex);
 
     std::cout << "entering open_write_to_port with session_id: " << session_id << std::endl;
-    int sockfd, conn_sockfd;
+    /*int sockfd, conn_sockfd;
     socklen_t clilen;
     struct sockaddr_in serv_addr, cli_addr;
     clilen = sizeof( cli_addr );
@@ -1075,7 +1138,22 @@ void open_write_to_port( rsComm_t* comm, int portno, std::string msg, /*bool aut
         return;
     }
     listen( sockfd, 1 );
+    */
     
+    //////////////
+    int sockfd, conn_sockfd;
+    socklen_t clilen;
+    struct sockaddr_in cli_addr;
+    clilen = sizeof( cli_addr );
+
+    int ret = bind_port( portno, &sockfd );
+    if ( ret < 0 ) {
+        perror( "error binding to port" );
+        return;
+    }
+    std::cout << "bound to port: " << *portno << std::endl;
+    /////////////
+
     // notify that port is open so that main thread can continue and return
     std::cout << "notifying port_is_open_cond" << std::endl;
     port_opened = true;
@@ -1457,11 +1535,18 @@ irods::error openid_auth_agent_request(
         port_opened = false;
         
         rodsLog( LOG_NOTICE, "Starting write thread" );
-        write_thread = new std::thread( open_write_to_port, _ctx.comm(), OPENID_COMM_PORT, write_msg, session_id ); 
+        int portno = 0;
+        //write_thread = new std::thread( open_write_to_port, _ctx.comm(), OPENID_COMM_PORT, write_msg, session_id ); 
+        write_thread = new std::thread( open_write_to_port, _ctx.comm(), &portno, write_msg, session_id ); 
         while ( !port_opened ) {
             port_is_open_cond.wait(lock);
             std::cout << "cond woke up" << std::endl;
         }
+        std::cout << "main thread received portno: " << portno << std::endl;
+        irods::kvp_map_t return_map;
+        std::string port_str = std::to_string( portno );
+        return_map["port"] = port_str;
+        ptr->request_result( irods::escaped_kvp_string( return_map ) );
         write_thread->detach();
 
     } // end context check
