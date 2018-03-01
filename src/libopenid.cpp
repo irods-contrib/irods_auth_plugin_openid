@@ -37,6 +37,10 @@
 #include <string>
 
 ///OPENID includes
+// libhttp-parser-dev (ubuntu)
+// http-parser http-parser-devel (centos)
+//#include <http_parser.h> // TODO either finish or delete
+
 #include <sstream>
 #include <map>
 #include <thread>
@@ -47,6 +51,7 @@
 #include <fcntl.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <netinet/in.h>
 #include <curl/curl.h>
 #include <boost/algorithm/string.hpp>
@@ -74,26 +79,32 @@ static const int requireServerAuth = 0;
 
 static const std::string AUTH_OPENID_SCHEME("openid");
 
-boost::property_tree::ptree *get_provider_metadata(std::string provider_metadata_url);
+boost::property_tree::ptree *get_provider_metadata( std::string provider_metadata_url );
 
-void send_success(int sockfd);
-std::string *accept_request(int portno);
+void send_success( int sockfd );
+int accept_request( std::string state, std::string& code );
 
-std::map<std::string,std::string> *get_params(std::string req);
+int get_params( std::string req, std::map<std::string,std::string>& req_map_out );
 
-bool get_access_token(std::string token_endpoint_url,
-                         std::string authorization_code,
-                         std::string client_id,
-                         std::string client_secret,
-                         std::string redirect_uri,
-                         std::string* response);
+bool get_access_token( std::string token_endpoint_url,
+                       std::string authorization_code,
+                       std::string client_id,
+                       std::string client_secret,
+                       std::string redirect_uri,
+                       std::string* response);
 
-bool get_provider_metadata_field(std::string provider_metadata_url, const std::string fieldname, std::string& value);
-irods::error generate_authorization_url(std::string& urlBuf);
-irods::error openid_authorize(std::string& id_token, std::string& access_token, std::string& expires_in, std::string& refresh_token);
+bool get_provider_metadata_field( std::string provider_metadata_url, const std::string fieldname, std::string& value );
+irods::error generate_authorization_url( std::string& urlBuf, std::string auth_state, std::string auth_nonce );
+irods::error openid_authorize(
+        std::string state,
+        std::string nonce,
+        std::string& subject_id,
+        std::string& access_token,
+        std::string& expires_in,
+        std::string& refresh_token );
 // OPENID helper methods
-bool curl_post(std::string url, std::string *fields, std::vector<std::string> *headers, std::string *response);
-std::string *curl_get(std::string url, std::string *fields);
+bool curl_post( std::string url, std::string *fields, std::vector<std::string> *headers, std::string *response );
+std::string *curl_get( std::string url, std::string *fields );
 
 ///END DECLARATIONS
 
@@ -210,37 +221,6 @@ void read_from_server( int portno, std::string nonce /*TODO*/,std::string& user_
         perror( "error reading url from socket" );
         return;
     }
-
-    /*read( sockfd, &data_len, sizeof( data_len ) );
-    memset( buffer, 0, READ_LEN );
-    // read that many bytes into our buffer, which contains the Authorization url
-    while ( total_bytes < data_len ) {
-        int bytes_remaining = data_len - total_bytes;
-        if ( bytes_remaining < READ_LEN ) {
-            // can read rest of data in one go
-            n_bytes = read( sockfd, buffer, bytes_remaining );
-        }
-        else {
-            // read max bytes into buffer
-            n_bytes = read( sockfd, buffer, READ_LEN );
-        }
-        if ( n_bytes == -1 ) {
-            // error reading
-            break;
-        }
-        if ( n_bytes == 0 ) {
-            // no more data
-            break;
-        }
-        //std::cout << "received " << n_bytes << " bytes: " << buffer << std::endl;
-        //for ( int i = 0; i < n_bytes; i++ ) {
-        //    printf( "%02X", buffer[i] );
-        //}
-        //printf( "\n" );
-        authorization_url_buf.append( buffer );
-        total_bytes += n_bytes;
-        memset( buffer, 0, READ_LEN );
-    }*/
     // finished reading authorization url
     // if the auth url is "true", session is already authorized, no user action needed
     // TODO find better way to signal a valid session, debug issue with using empty message as url
@@ -256,38 +236,6 @@ void read_from_server( int portno, std::string nonce /*TODO*/,std::string& user_
         perror( "error reading username from server" );
         return;
     }
-    /*
-    read( sockfd, &data_len, sizeof( data_len ) );
-    total_bytes = 0;
-    memset( buffer, 0, READ_LEN );
-    while ( total_bytes < data_len ) {
-        int bytes_remaining = data_len - total_bytes;
-        if ( bytes_remaining < READ_LEN ) {
-            // can read rest of data in one go
-            n_bytes = read( sockfd, buffer, bytes_remaining );
-        }
-        else {
-            // read max bytes into buffer
-            n_bytes = read( sockfd, buffer, READ_LEN );
-        }
-        if ( n_bytes == -1 ) {
-            // error reading
-            break;
-        }
-        if ( n_bytes == 0 ) {
-            // no more data
-            break;
-        }
-        //std::cout << "received " << n_bytes << " bytes: " << buffer << std::endl;
-        //for ( int i = 0; i < n_bytes; i++ ) {
-        //    printf( "%02X", buffer[i] );
-        //}
-        //printf( "\n" );
-        user_name->append( buffer );
-        total_bytes += n_bytes;
-        memset( buffer, 0, READ_LEN );
-    } // finished reading username string from server
-    */
     std::cout << "read user_name: " << user_name << std::endl;
 
     // wait for session token now
@@ -295,38 +243,6 @@ void read_from_server( int portno, std::string nonce /*TODO*/,std::string& user_
         perror( "error reading session token from server" );
         return;
     }
-    /*
-    read( sockfd, &data_len, sizeof( data_len ) );
-    total_bytes = 0;
-    memset( buffer, 0, READ_LEN );
-    while ( total_bytes < data_len ) {
-        int bytes_remaining = data_len - total_bytes;
-        if ( bytes_remaining < READ_LEN ) {
-            // can read rest of data in one go
-            n_bytes = read( sockfd, buffer, bytes_remaining );
-        }
-        else {
-            // read max bytes into buffer
-            n_bytes = read( sockfd, buffer, READ_LEN );
-        }
-        if ( n_bytes == -1 ) {
-            // error reading
-            break;
-        }
-        if ( n_bytes == 0 ) {
-            // no more data
-            break;
-        }
-        //std::cout << "received " << n_bytes << " bytes: " << buffer << std::endl;
-        //for ( int i = 0; i < n_bytes; i++ ) {
-        //    printf( "%02X", buffer[i] );
-        //}
-        //printf( "\n" );
-        session_token->append( buffer );
-        total_bytes += n_bytes;
-        memset( buffer, 0, READ_LEN );
-    } // finished reading session from server
-    */
     std::cout << "read session token: " << session_token << std::endl;
 
     close( sockfd );
@@ -632,7 +548,8 @@ irods::error openid_auth_agent_start(
 }
 
 
-irods::error generate_authorization_url( std::string& urlBuf ) {    
+irods::error generate_authorization_url( std::string& urlBuf, std::string auth_state, std::string auth_nonce )
+{
     irods::error ret;
     std::string provider_discovery_url;
     ret = _get_server_property( "openid_provider_discovery_url", provider_discovery_url );
@@ -652,23 +569,32 @@ irods::error generate_authorization_url( std::string& urlBuf ) {
         std::cout << "Provider discovery metadata missing fields" << std::endl;
         return ERROR(-1, "Provider discovery metadata missing fields");
     }
+    
 
-    std::string authorize_url_fmt = "%s?response_type=%s&access_type=%s&prompt=%s&scope=%s&client_id=%s&redirect_uri=%s";
-    boost::format fmt( authorize_url_fmt );
-    fmt % authorization_endpoint
-        % "code"
-        % "offline"
-        % "login%20consent"
-        % "openid%20profile%20email"
-        % client_id
-        % redirect_uri; 
-        
-    urlBuf = fmt.str();
+    std::ostringstream url_stream;
+    url_stream << authorization_endpoint << "?";
+    url_stream << "response_type=" << "code";
+    url_stream << "&access_type=" << "offline";
+    url_stream << "&prompt=" << "login%20consent";
+    url_stream << "&scope=" << "openid%20profile%20email";
+    url_stream << "&client_id=" << client_id;
+    url_stream << "&redirect_uri=" << redirect_uri;
+    url_stream << "&nonce=" << auth_nonce; // returned encoded in id_token in access_token response
+    url_stream << "&state=" << auth_state; // returned in authorization redirect request
+
+    urlBuf = url_stream.str();
     return SUCCESS();
 }
 
 
-irods::error openid_authorize( std::string& id_token, std::string& access_token, std::string& expires_in, std::string& refresh_token ) {
+irods::error openid_authorize(
+        std::string state,
+        std::string nonce,
+        std::string& subject_id,
+        std::string& access_token,
+        std::string& expires_in,
+        std::string& refresh_token )
+{
     std::cout << "entering openid_authorize" << std::endl;
     irods::error ret; 
     std::string provider_discovery_url;
@@ -685,17 +611,22 @@ irods::error openid_authorize( std::string& id_token, std::string& access_token,
     if ( !ret.ok() ) return ret;
     
     std::string token_endpoint;
-    std::string *request_message = accept_request( 8080 ); // TODO make configurable
-    std::map<std::string,std::string> *param_map = get_params( *request_message );
+    std::string authorization_code;
+    int retval = accept_request( state, authorization_code );
+    if ( retval < 0 ) {
+        return ERROR( retval, "error accepting authorization request" );
+    }
+    //std::map<std::string,std::string> param_map;
+    //get_params( *request_message, param_map );
     
     if ( !get_provider_metadata_field( provider_discovery_url, "token_endpoint", token_endpoint) ) {
         std::cout << "Provider discovery metadata missing fields" << std::endl;
         return ERROR(-1, "Provider discovery metadata missing fields");
     }
-
+    
     // check for code in callback
-    if ( param_map->find("code") != param_map->end() ) {
-        std::string authorization_code = param_map->at("code");
+    if ( authorization_code.size() > 0 /*param_map.find("code") != param_map.end()*/ ) {
+        //std::string authorization_code = param_map.at("code");
         std::string access_token_response;
         bool token_ret = get_access_token(
                         token_endpoint,
@@ -718,11 +649,39 @@ irods::error openid_authorize( std::string& id_token, std::string& access_token,
             return ERROR( -1, "Token response indicated an error in the request" );
         }
         else {
-            id_token = response_tree.get<std::string>("id_token");
+            std::string id_token_base64 = response_tree.get<std::string>("id_token");
             access_token = response_tree.get<std::string>("access_token");
             expires_in = response_tree.get<std::string>("expires_in");
-
+            
+            // decode id_token here instead of in caller, verify nonce field is in the id_token
+            // base64 decode the id_token to get profile info from it (name, email)
+            std::string header, body;
+            decode_id_token( id_token_base64, &header, &body );
+            std::cout << "decoded id_token: " << body << std::endl; 
+            
+            // get Subject from the id_token decoded body
+            boost::property_tree::ptree body_tree;
+            std::stringstream body_stream( body );
+            boost::property_tree::read_json( body_stream, body_tree );
+            if ( body_tree.find( "sub" ) == body_tree.not_found() ) {
+                std::cout << "Subject ID not in the response returned by OIDC Provider" << std::endl;
+                return ERROR( -1, "subject id not in the access token response from the OIDC Provider" );
+            }
+            subject_id = body_tree.get<std::string>( "sub" );
+            std::cout << "subject id: " << subject_id << std::endl;
+            
+            // verify nonce matches that sent by us on the intial authorization request 
+            if ( body_tree.find( "nonce" ) == body_tree.not_found()
+                 || body_tree.get<std::string>( "nonce" ).compare( nonce ) != 0 ) {
+                // this id_token response is not from our token request
+                // possible replay or man-in-the-middle attack
+                rodsLog( LOG_ERROR, "Possible replay attack detected against subject [%s]", subject_id.c_str() );
+                return ERROR( -1, "Token request returned invalid response" );
+            }
+            
             if ( response_tree.find("refresh_token") == response_tree.not_found() ) {
+                // This doesn't break the system, is just an inconvenience
+                // it means the OIDC Provider does not implement the refresh token mechanism
                 refresh_token = "";
                 rodsLog( LOG_WARNING, "Access token response did not contain a refresh token" );
             }
@@ -741,7 +700,7 @@ irods::error openid_authorize( std::string& id_token, std::string& access_token,
     return SUCCESS();
 }
 
-irods::error get_username_by_subject_id( rsComm_t *comm, std::string subject_id, std::string *username )
+irods::error get_username_by_subject_id( rsComm_t *comm, std::string subject_id, std::string& username )
 {
     rodsLog( LOG_NOTICE, "entering get_username_by_subject_id with: %s", subject_id.c_str() );
     int status;
@@ -778,7 +737,7 @@ irods::error get_username_by_subject_id( rsComm_t *comm, std::string subject_id,
     char *name = genQueryOut->sqlResult[1].value;
     printf( "query by subject_id returned (id,name): (%s,%s)\n", id, name );
 
-    username->assign( name );
+    username.assign( name );
     rodsLog( LOG_NOTICE, "leaving get_username_by_subject_id" );
     return SUCCESS();
 }
@@ -839,7 +798,7 @@ irods::error get_username_by_session_id( rsComm_t *comm, std::string session_id,
     return SUCCESS();
 }
 
-irods::error get_subject_id_by_session_id( rsComm_t *comm, std::string session_id, std::string *subject_id ) {
+irods::error get_subject_id_by_session_id( rsComm_t *comm, std::string session_id, std::string& subject_id ) {
     std::cout << "entering get_subject_id_by_session_id with: " << session_id << std::endl;
     int status;
     genQueryInp_t genQueryInp;
@@ -886,7 +845,7 @@ irods::error get_subject_id_by_session_id( rsComm_t *comm, std::string session_i
     printf( "query by session_id returned (attribute,value,user,subject): (%s,%s,%s,%s)\n",
                 attr_name, attr_value, user_name, user_subject );
 
-    subject_id->assign( user_subject );
+    subject_id.assign( user_subject );
     std::cout << "leaving get_subject_id_by_session_id" << std::endl;
     return SUCCESS();
 }
@@ -1202,44 +1161,30 @@ int generate_nonce( size_t len, std::string& buf_out )
     session_id: if emtpy, will wait for an authorization callback to generate a session id. If not empty, will use it as the
         session id and send it back to client.
 */
-void open_write_to_port( rsComm_t* comm, int *portno, std::string *nonce, std::string msg, /*bool authorized,*/ std::string session_id)
+void open_write_to_port( 
+        rsComm_t* comm, int *portno, 
+        std::string nonce,
+        std::string auth_state,
+        std::string auth_nonce,
+        std::string msg,
+        std::string session_id)
 {
     std::unique_lock<std::mutex> lock(port_mutex);
     //std::unique_lock<std::mutex> lock(port_mutex);
 
     std::cout << "entering open_write_to_port with session_id: " << session_id << std::endl;
-    /*int sockfd, conn_sockfd;
-    socklen_t clilen;
-    struct sockaddr_in serv_addr, cli_addr;
-    clilen = sizeof( cli_addr );
-    sockfd = socket( AF_INET, SOCK_STREAM, 0 );
-    if ( sockfd < 0 ) {
-        perror( "socket" );
-        return;
-    }
-    // allow system to reuse a socket address on subsequent connection
-    int opt_val = 1;
-    setsockopt( sockfd, SOL_SOCKET, SO_REUSEADDR, (const void*)&opt_val, sizeof( opt_val ) );
-    memset( &serv_addr, 0, sizeof( serv_addr ) );
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_addr.s_addr = INADDR_ANY;
-    serv_addr.sin_port = htons( portno );
-    if ( bind( sockfd, (struct sockaddr*) &serv_addr, sizeof( serv_addr ) ) < 0 ) {
-        std::stringstream err_stream("error binding to socket on port: ");
-        err_stream << portno;
-        perror( err_stream.str().c_str() );
-        close( sockfd );
-        return;
-    }
-    listen( sockfd, 1 );
-    */
-   
+
     int ret;
-    ret = generate_nonce( 32, *nonce );
+    /*std::string nonce;
+    ret = generate_nonce( 32, nonce );
     if ( ret < 0 ) {
         perror( "error generating nonce" );
         return;
     }
+    std::cout << "generated nonce: " << nonce << std::endl;
+    // create copy of nonce for caller, which can be destructed safely
+    nonce_out->assign( nonce );
+*/
     //////////////
     int sockfd, conn_sockfd;
     socklen_t clilen;
@@ -1259,7 +1204,7 @@ void open_write_to_port( rsComm_t* comm, int *portno, std::string *nonce, std::s
     port_opened = true;
     lock.unlock();
     port_is_open_cond.notify_all();
-    
+
     // wait for a client connection
     conn_sockfd = accept( sockfd, (struct sockaddr*) &cli_addr, &clilen );
     if ( conn_sockfd < 0 ) {
@@ -1267,22 +1212,21 @@ void open_write_to_port( rsComm_t* comm, int *portno, std::string *nonce, std::s
         close( sockfd );
         return;
     }
-    
-    // verify client nonce
+
+    // verify client nonce matches the nonce we sent back from auth_agent_request
     std::string client_nonce;
     if ( read_msg( conn_sockfd, client_nonce ) < 0 ) {
         perror( "error reading nonce from client" );
         return;
     }
     std::cout << "received nonce from client: " << client_nonce << std::endl;
-    
-    if ( nonce->compare( client_nonce ) != 0 ) {
+
+    if ( nonce.compare( client_nonce ) != 0 ) {
         rodsLog( LOG_WARNING, "Received connection on port %d from client who provided incorrect nonce. Expected [%s] but got [%s]",
-                                *portno, nonce->c_str(), client_nonce.c_str() );
+                                *portno, nonce.c_str(), client_nonce.c_str() );
     }
-
-
-
+    
+    // send 3 messages [url/true, username, session_id]
     if ( session_id.empty() ) {
         std::cout << "starting write for empty session_id" << std::endl;
         int msg_len = msg.size();
@@ -1291,26 +1235,22 @@ void open_write_to_port( rsComm_t* comm, int *portno, std::string *nonce, std::s
         std::cout << "wrote " << msg_len << " bytes for msg: " << msg << std::endl;
 
         // client should now browse to that url sent (msg)
-        // TODO check/verify timeout on openid_authorize function
-        std::string id_token_base64;
+        std::string subject_id;
         std::string access_token;
         std::string expires_in;
         std::string refresh_token;
         
         // TODO handle error return from authorize call
-        irods::error ret = openid_authorize( id_token_base64, access_token, expires_in, refresh_token );
+        irods::error ret = openid_authorize( auth_state, auth_nonce, subject_id, access_token, expires_in, refresh_token );
         if ( !ret.ok() ) {
-            // TODO
+            throw std::runtime_error( "authorization failed" );
         }
         std::cout << "returned from authorize" << std::endl;
  
-        // base64 decode the id_token to get profile info from it (name, email)
-        std::string header, body;
-        decode_id_token( id_token_base64, &header, &body );
-        std::cout << "decoded id_token: " << body << std::endl;
-
-        // this is too long to store as the password (session token), so create one for use in irods,
-        // which will map as they key to the actual id/access token. 
+        // this access_toekn is too long to store as the password (session token),
+        // so create one for use in irods, which will map as the key to the actual
+        // access_token and any additional information like expiry and per-user refresh_token
+        // TODO TODO TODO TODO SWITCH TO SHA-256, will actually fit within 50 bytes when base64ed (32->42(44)) 
         // Max irods password is 50bytes, SHA-1 is 20, base64(sha-1) is 27 bytes (28 with pad)
         char irods_session_token[MAX_PASSWORD_LEN + 1];
         memset( irods_session_token, 0, MAX_PASSWORD_LEN + 1 );
@@ -1328,7 +1268,7 @@ void open_write_to_port( rsComm_t* comm, int *portno, std::string *nonce, std::s
         memset( base64_sha1_buf, 0, base64_sha1_len );
 
         // access_token is unique per OIDC authentication so use in in sess id
-        obfMakeOneWayHash(
+        obfMakeOneWayHash( // TODO do sha-256 instead
             HASH_TYPE_SHA1, 
             (const unsigned char*) access_token.c_str(),
             access_token.size(),
@@ -1353,29 +1293,13 @@ void open_write_to_port( rsComm_t* comm, int *portno, std::string *nonce, std::s
 
         strncpy( irods_session_token, base64_sha1_buf, base64_sha1_len );
         std::cout << "created session token: " << irods_session_token << std::endl;
-    
-        // get Subject from the id_token decoded body
-        boost::property_tree::ptree body_tree;
-        std::stringstream body_stream( body );
-        boost::property_tree::read_json( body_stream, body_tree );
-        std::string subject_id;
-        if ( body_tree.find( "sub" ) == body_tree.not_found() ) {
-            std::cout << "Subject ID not in the response returned by OIDC Provider" << std::endl;
-            close( conn_sockfd );
-            close( sockfd );
-            std::cout << "leaving open_write_to_port" << std::endl;
-            //return ERROR( -1, "Subject fild missing from OIDC Provider response" );
-            return;
-        }
-        subject_id = body_tree.get<std::string>( "sub" );
-        std::cout << "subject id: " << subject_id << std::endl;
-    
+ 
         // put session token in the server database
         // user attribute: lib/api/include/modAVUMetadata.h
         // format: imeta add -u <username> <keyname> <value>
         
         std::string user_name;
-        ret = get_username_by_subject_id( comm, subject_id, &user_name );
+        ret = get_username_by_subject_id( comm, subject_id, user_name );
         if ( !ret.ok() ) {
             std::cout << "error retrieving username from subject id" << std::endl;
             return;
@@ -1469,7 +1393,7 @@ void open_write_to_port( rsComm_t* comm, int *portno, std::string *nonce, std::s
     close( conn_sockfd );
     close( sockfd );
     std::cout << "leaving open_write_to_port" << std::endl;
-    // done writing, reset thread pointer;
+    // done writing, reset thread pointer; // looks like agents are fresh processes, so this can be changed
     delete write_thread;
     write_thread = NULL;
 }
@@ -1588,7 +1512,7 @@ irods::error openid_auth_agent_request(
                 long expiry = std::stol( expiry_str, NULL, 10 );
                 if ( now >= expiry ) {
                     rodsLog( LOG_NOTICE, "Access token for session %s is expired, attempting refresh", session_id.c_str() );
-                    //TODO Lookup refresh token for this user
+                    // lookup refresh token for this user
                     std::string user( irods_user );
                     std::string refresh_token;
                     ret = get_refresh_token_for_user( _ctx.comm(), user, refresh_token );
@@ -1600,7 +1524,6 @@ irods::error openid_auth_agent_request(
                         authorized = false;
                     }
                     else {
-                        //std::string refresh_token = metadata_map["refresh_token"];
                         ret = refresh_access_token( access_token, expiry_str, refresh_token );
                         if ( !ret.ok() ) {
                             // could not obtain new access/refresh token from endpoint
@@ -1629,15 +1552,44 @@ irods::error openid_auth_agent_request(
                     write_msg = "true";
                     authorized = true;
                 }
-
             }
             
         } // end got a session id
         
+        /*
+            There are 3 nonces in play here.
+            nonce: send back to plugin client, which is used to verify that a connection on secondary comm port is actually that client
+            auth_nonce: used as part of the OIDC spec, sent in authorization request, and returned as part of the id_token in the token response
+            auth_state: used as part of the OIDC spec, send in authorization request, and returned as param on the callback/redirect request 
+                            to us (authorization_code callback)
+        */
+        std::string nonce;
+        // this is sent as part of irods rpc, careful about size TODO check for constraints on this size
+        int nonce_ret = generate_nonce( 16, nonce );
+        if ( nonce_ret < 0 ) {
+            return ERROR( nonce_ret, "error generating nonce" );
+        }
+        std::cout << "generated nonce: " << nonce << std::endl;
+
+        std::string auth_nonce;
+        nonce_ret = generate_nonce( 48, auth_nonce );
+        if ( nonce_ret < 0 ) {
+            return ERROR( nonce_ret, "error generating nonce" );
+        }
+        std::cout << "generated auth_nonce: " << nonce << std::endl;
+
+        std::string auth_state;
+        nonce_ret = generate_nonce( 32, auth_state ); // do state/nonce different sizes so easy to see difference
+        if ( nonce_ret < 0 ) {
+            return ERROR( nonce_ret, "error generating state" );
+        }
+        std::cout << "generated auth_state: " << auth_state << std::endl;
+
+        // generate a url with the nonce and state params on it
         if ( authorized == false ) {
             rodsLog( LOG_NOTICE, "Session is not valid, generating authorization url" );
             std::string authorization_url;
-            ret = generate_authorization_url( authorization_url );
+            ret = generate_authorization_url( authorization_url, auth_state, auth_nonce );
             if ( !ret.ok() ) {
                 return ret;
             }
@@ -1645,14 +1597,12 @@ irods::error openid_auth_agent_request(
             authorized = false;
             session_id = "";
         }
-
+        
+        int portno = 0;
         std::unique_lock<std::mutex> lock(port_mutex);
         port_opened = false;
-        
         rodsLog( LOG_NOTICE, "Starting write thread" );
-        int portno = 0;
-        std::string nonce;
-        write_thread = new std::thread( open_write_to_port, _ctx.comm(), &portno, &nonce, write_msg, session_id ); 
+        write_thread = new std::thread( open_write_to_port, _ctx.comm(), &portno, nonce, auth_state, auth_nonce, write_msg, session_id ); 
         while ( !port_opened ) {
             port_is_open_cond.wait(lock);
             std::cout << "cond woke up" << std::endl;
@@ -1661,7 +1611,7 @@ irods::error openid_auth_agent_request(
         irods::kvp_map_t return_map;
         std::string port_str = std::to_string( portno );
         return_map["port"] = port_str;
-        return_map["nonce"] = nonce;
+        return_map["nonce"] = nonce; // client plugin must send this as first message when connecting to port
         ptr->request_result( irods::escaped_kvp_string( return_map ) );
         write_thread->detach();
 
@@ -2098,7 +2048,7 @@ boost::property_tree::ptree *get_provider_metadata(std::string provider_metadata
     return metadata_tree;
 }
 
-
+// TODO agents are separate processes, could use shared memory, or not care about having to look up the metadata each time
 static std::map<std::string,boost::property_tree::ptree*> provider_discovery_metadata_cache;
 
 bool get_provider_metadata_field(std::string provider_metadata_url, const std::string fieldname, std::string& value)
@@ -2127,14 +2077,57 @@ bool get_provider_metadata_field(std::string provider_metadata_url, const std::s
 }
 
 
+/*
+std::string url;
+int get_params2( std::string req, std::string& map )
+{
+    http_parser parser;
+    http_parser_settings settings;
+    http_parser_init( &parser, HTTP_REQUEST );
+    memset( &settings, 0, sizeof( settings ) );
+    
+    std::map<std::string,std::string> headers;
+    std::string last_header_field;
+    settings.on_message_begin = [](http_parser* parser)
+    {
+        return 0;
+    };
+    settings.on_header_field = [](http_parser* parser, const char* buf, size_t len)
+    {
+        return 0;
+    };
+    settings.on_header_value = [](http_parser* parser, const char* buf, size_t len)
+    {
+        return 0;
+    };
+    settings.on_url = [](http_parser* parser, const char* buf, size_t len)
+    {
+        url.append( buf );
+        return 0;
+    };
+    settings.on_headers_complete = [](http_parser* parser)
+    {
+        return 0;
+    };
+    settings.on_message_complete = [](http_parser* parser)
+    {
+        return 0;
+    };
+    
+    
+
+    return 0;
+}
+*/
+
 /* Takes a GET request string. This is the literal string representation of the request.
  * Looks for the line with the request path, and splits it up into pair<key, value> for each request parameter
  * If the key has no value, the value part of the pair is left as an empty string. 
  * Returns a map<string,string> of each request parameter
  */
-std::map<std::string,std::string> *get_params(std::string req)
+int get_params(std::string req, std::map<std::string,std::string>& req_map_out)
 {
-    std::map<std::string,std::string> *req_map = new std::map<std::string,std::string>();
+    std::map<std::string,std::string> *req_map = &req_map_out;
     std::vector<std::string> split_vector;
     boost::split(split_vector, req, boost::is_any_of("\r\n"), boost::token_compress_on);
     // iterate over lines in the request string
@@ -2182,7 +2175,7 @@ std::map<std::string,std::string> *get_params(std::string req)
         }
     }
 
-    return req_map;
+    return 0;
 }
 
 static size_t _curl_writefunction_callback( void *contents, size_t size, size_t nmemb, void *s )
@@ -2302,8 +2295,260 @@ std::string *curl_get(std::string url, std::string *params)
     return response;
 }
 
-std::string *accept_request(int portno)
+static std::atomic_bool keep_accepting_requests( true );
+void redirect_server_accept_thread( int request_port, std::map<std::string,int> *listeners )
 {
+    rodsLog( LOG_NOTICE, "starting redirect accept thread on port %d", request_port );
+    int request_queue_len = 20;
+    int sockfd, ret;
+    struct sockaddr_in server_address;
+    //struct sockaddr_in client_address;
+    sockfd = socket( AF_INET, SOCK_STREAM, 0 );
+
+    memset( &server_address, 0, sizeof( server_address ) );
+    server_address.sin_family = AF_INET;
+    server_address.sin_addr.s_addr = htonl( INADDR_ANY );
+    server_address.sin_port = htons( request_port );
+    ret = bind( sockfd, (struct sockaddr *)&server_address, sizeof(server_address) );
+    if ( ret < 0 ) {
+        std::stringstream err_stream;
+        err_stream << "binding to port " << request_port << " failed: ";
+        perror( err_stream.str().c_str()  );
+        return;
+    }
+    listen( sockfd, request_queue_len );
+    rodsLog( LOG_NOTICE, "redirect server accepting requests on port %d", request_port );
+    const long tv_accept_sec = 30;
+    const long tv_recv_sec = 5;
+    const size_t BUF_LEN = 2048;
+    socklen_t socksize = sizeof( sockaddr_in );
+    while ( keep_accepting_requests ) {
+        // accept new requests
+        // set up connection socket
+        struct sockaddr_in client_address;
+        // maybe don't timeout the accept, possible race condition on connection during small reset window
+        struct timeval timeout_accept;
+        timeout_accept.tv_sec = tv_accept_sec;
+        timeout_accept.tv_usec = 0;
+        fd_set read_fds;
+        FD_ZERO( &read_fds );
+        FD_SET( sockfd, &read_fds );
+        ret = select( sockfd+1, &read_fds, NULL, NULL, &timeout_accept ); // wait for connection for 30 sec
+        if ( ret < 0 ) {
+            perror( "error setting timeout with select" );
+            return;
+        }
+        else if ( ret == 0 ) {
+            rodsLog( LOG_NOTICE, "Timeout reached after %d sec while accepting request on port %d", timeout_accept.tv_sec, request_port );
+            continue; // this is just so the thread will check to see if it should stop every tv_sec
+        }
+
+        int conn_sock_fd = accept(sockfd, (struct sockaddr *)&client_address, &socksize);
+        rodsLog( LOG_NOTICE, "accepted request on port %d", request_port );
+
+        char buf[BUF_LEN+1]; buf[BUF_LEN] = 0x0;
+        struct timeval timeout_recv;
+        timeout_recv.tv_sec = tv_recv_sec; // after accepting connection, will terminate if no data sent for 5 sec
+        timeout_recv.tv_usec = 0;
+        setsockopt( conn_sock_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout_recv, sizeof(timeout_recv) );
+        std::string request_str;
+        while (1) {
+            int received_len = recv( conn_sock_fd, buf, BUF_LEN, 0 );
+            std::cout << "Received " << received_len << std::endl;
+            if (received_len == -1) {
+                // EAGAIN EWOULDBLOCK
+                std::cout << "Timeout reached" << std::endl;
+                send_success(conn_sock_fd);
+                close( conn_sock_fd );
+                break;
+            }
+            if (received_len == 0) {
+                std::cout << "Closing connection" << std::endl;
+                send_success( conn_sock_fd );
+                close( conn_sock_fd );
+                break;
+            }
+            request_str.append( buf, received_len );
+        }
+        std::cout << "read request: " << request_str << std::endl;
+        std::map<std::string,std::string> params;
+        get_params( request_str, params );
+        if ( params.find( "code" ) == params.end() ) {
+            rodsLog( LOG_WARNING, "Received request on port %d which did not contain a code parameter", request_port );
+            continue;
+        }
+        std::string code = params["code"];
+        if ( params.find( "state" ) == params.end() ) {
+            rodsLog( LOG_WARNING, "Received request on port %d which did not contain a state parameter", request_port );
+            continue;
+        }
+        // TODO mutex listeners obj
+        std::string state = params["state"];
+        if ( listeners->find( state ) == listeners->end() ) {
+            rodsLog( LOG_ERROR, "Received request on port %d which contained an unrecognized state value [%s]", request_port, state.c_str() );
+            continue;
+        }
+        
+        // write the code to the listener socket
+        int listener_sockfd = listeners->at( state );
+        int code_len = code.size();
+        write( listener_sockfd, &code_len, sizeof( code_len ) );
+        write( listener_sockfd, code.c_str(), code_len );
+        
+        // end this listener
+        close( listener_sockfd );
+        listeners->erase( state );
+    }
+}
+
+//TODO config settings
+const int request_port = 8080;
+const int queue_len = 10;
+const char *unix_sock_name = "\0/tmp/irodsoidcipcsock"; //TODO can randomize up to sockaddr_un.sun_path length)
+// end config settings
+int redirect_server()
+{
+    rodsLog( LOG_NOTICE, "starting redirect server" );
+
+    std::map<std::string,int> listeners; // map of state->socket
+    int ipc_sock, ret;
+    struct sockaddr_un server_addr;
+    memset( &server_addr, 0, sizeof( sockaddr_un ) );
+
+    // we'll use the same msg protocol as plugin messaging. OIDC spec says not to make assumptions about authorization code length
+    // if it were standardized, we could use SOCK_SEQPACKET and simplify the logic
+    ipc_sock = socket( AF_UNIX, SOCK_STREAM, 0 );
+    if ( ipc_sock < 0 ) {
+        perror( "error creating Unix socket" );
+        return ipc_sock;
+    }
+    memset( &server_addr, 0, sizeof( server_addr ) );
+    server_addr.sun_family = AF_UNIX;
+    strncpy( server_addr.sun_path, unix_sock_name, sizeof( server_addr.sun_path ) - 1 );
+    
+    //ret = unlink( unix_sock_name ); // remove it if it was still there
+    //if ( ret < 0 ) {
+    //    // ignore this error
+    //    perror( "unlink" );
+    //}
+
+    ret = bind( ipc_sock, (struct sockaddr *)&server_addr, sizeof(server_addr) );
+    if ( ret < 0 ) {
+        std::stringstream err_stream;
+        err_stream << "binding to unix socket: " << unix_sock_name << " failed: ";
+        perror( err_stream.str().c_str()  );
+        return ret;
+    }
+    listen( ipc_sock, queue_len );
+    rodsLog( LOG_NOTICE, "redirect ipc server running with queue length of %d", queue_len );
+
+    std::thread req_thread( redirect_server_accept_thread, request_port, &listeners );
+    socklen_t addr_size = sizeof( struct sockaddr_un );
+
+    while ( true ) {
+        // accepting listeners, which are irods agent-side plugins waiting for auth-callbacks
+
+        int conn_sock = accept( ipc_sock, (struct sockaddr*)&server_addr, &addr_size );
+        int msg_len;
+        // TODO error handling
+        read( conn_sock, &msg_len, sizeof( msg_len ) );
+        char buf[msg_len + 1];
+        memset( buf, 0, msg_len + 1 );
+        read( conn_sock, buf, msg_len );
+        std::cout << "received callback listener with state identifier: " << buf << std::endl;
+        
+        // TODO need some sort of more complex structure in the map, to store a connection time and TTL
+        // so connections that have been waiting around to too long are removed from the listener map and closed
+        listeners.insert( std::pair<std::string,int>( std::string( buf ), conn_sock ) );
+    }
+
+    //ret = unlink( unix_sock_name );
+    //if ( ret < 0 ) {
+    //    perror( "unlink" );
+    //}
+    return 0;
+}
+
+
+/*
+    State is used to identify the request from the provider
+*/
+int accept_request( std::string state, std::string& code )
+{
+    // check for ipc socket, to see if server is already running, otherwise spin it up
+    struct stat s_buf; // TODO don't like how brittle it is to see if the server is already running
+    bool http_server_running = ( stat( unix_sock_name, &s_buf ) == 0 );
+    // TODO maybe switch over to regular TCP socket on loopback address
+    if ( !http_server_running ) {
+        // start the redirect server process
+        rodsLog( LOG_NOTICE, "forking new http server" );
+        pid_t pid = fork();
+        if ( pid < 0 ) {
+            perror( "could not fork" );
+            return pid;
+        }
+        else if ( pid == 0 ) {
+            // child
+            int ret = redirect_server();
+            rodsLog( LOG_NOTICE, "redirect_server exited with status: %d", ret );
+            return ret;
+        }
+    }
+
+    // it is running now
+    // wait for up to 30 seconds for redirect server to be up
+
+
+    struct sockaddr_un addr;
+    int sock = socket( AF_UNIX, SOCK_STREAM, 0 );
+    if ( sock < 0 ) {
+        perror( "socket" );
+        rodsLog( LOG_ERROR, "error creating socket" );
+        return sock;
+    }
+    memset( &addr, 0, sizeof( addr ) );
+    addr.sun_family = AF_UNIX;
+    strncpy( addr.sun_path, unix_sock_name, sizeof( addr.sun_path) - 1 );
+    rodsLog( LOG_NOTICE, "agent is connecting to http server via domain socket: %s", addr.sun_path );
+    int ret;// = connect( sock, (struct sockaddr*)&addr, sizeof( addr ) );
+    int waited = 0;
+    const int MAX_REDIRECT_SERVER_WAIT = 30;
+    while ( waited++ < MAX_REDIRECT_SERVER_WAIT ) {
+        ret = connect( sock, (struct sockaddr*)&addr, sizeof( addr ) );
+        if ( ret == 0 ) {
+            break;
+        }
+        std::cout << "waiting for redirect server to be up: " << waited << std::endl;
+        if ( waited >= MAX_REDIRECT_SERVER_WAIT ) {
+            perror( "connect" );
+            rodsLog( LOG_ERROR, "timeout reached while waiting for redirect server" );
+            return -1;
+        }
+        std::this_thread::sleep_for( std::chrono::seconds( 1 ) );
+    }
+    
+
+    // write state (one time code), to identify our plugin agent to the redirect server
+    int state_len = state.size();
+    write( sock, &state_len, sizeof( state_len ) );
+    write( sock, state.c_str(), state_len );
+    
+    // this will block for redirect server, until it returns a msg with the authorization code in it
+    read_msg( sock, code );
+    std::cout << "got code from redirect server: " << code << std::endl;
+    return 0;
+}
+
+/*
+    Wait for a request on port portno, verify parameter "nonce" was set to value nonce.
+
+    Insert into params map the k,v pairs of the param name and the param value.
+
+    On normal success return 0, on error return negative.
+*/
+int accept_request_OLD( int portno, std::string nonce, std::map<std::string,std::string> params_out )
+{
+    
     std::cout << "accepting request on port " << portno << std::endl;
     int sockfd, ret;
     struct sockaddr_in server_address;
@@ -2319,20 +2564,37 @@ std::string *accept_request(int portno)
         std::stringstream err_stream;
         err_stream << "binding to port " << portno << " failed: ";
         perror( err_stream.str().c_str()  );
-        return NULL;
+        return ret;
     }
     listen(sockfd, 1);
     std::string *message = new std::string("");
     
     // set up connection socket
     socklen_t socksize = sizeof(client_address);
+    struct timeval timeout_accept;
+    timeout_accept.tv_sec = 30;
+    timeout_accept.tv_usec = 0;
+    fd_set read_fds;
+    FD_ZERO( &read_fds );
+    FD_SET( sockfd, &read_fds );
+    ret = select( sockfd+1, &read_fds, NULL, NULL, &timeout_accept ); // wait for connection for 30 sec
+    if ( ret < 0 ) {
+        perror( "error setting timeout with select" );
+        return ret;
+    }
+    else if ( ret == 0 ) {
+        rodsLog( LOG_NOTICE, "Timeout reached after %d sec while accepting request on port %d", 
+                                timeout_accept.tv_sec, portno );
+        return -1;
+    }
+
     int conn_sock_fd = accept(sockfd, (struct sockaddr *)&client_address, &socksize);
     const size_t BUF_LEN = 2048;
     char buf[BUF_LEN+1]; buf[BUF_LEN] = 0x0;
-    struct timeval timeout;
-    timeout.tv_sec = 5; // after accepting connection, will terminate if no data sent for 5 sec
-    timeout.tv_usec = 0;
-    setsockopt(conn_sock_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    struct timeval timeout_recv;
+    timeout_recv.tv_sec = 5; // after accepting connection, will terminate if no data sent for 5 sec
+    timeout_recv.tv_usec = 0;
+    setsockopt(conn_sock_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout_recv, sizeof(timeout_recv));
 
     while (1)
     {
@@ -2356,6 +2618,9 @@ std::string *accept_request(int portno)
     }
     std::cout << "accepted request: " << *message << std::endl;
     close(sockfd);
-    return message;
+    //buf = message;
+    //TODO params
+
+    return 0;
 }
 
