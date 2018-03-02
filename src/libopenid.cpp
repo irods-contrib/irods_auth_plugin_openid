@@ -328,9 +328,9 @@ irods::error _base64_easy_encode( std::string in, std::string& out )
 
     char base64_buf[ base64_len ];
     memset( base64_buf, 0, base64_len );
-    std::cout << "in: " << in << std::endl;
-    std::cout << "inlen: " << in.size() << std::endl;
-    std::cout << "out max len: " << base64_len << std::endl;
+    //std::cout << "in: " << in << std::endl;
+    //std::cout << "inlen: " << in.size() << std::endl;
+    //std::cout << "out max len: " << base64_len << std::endl;
     int ret = base64_encode( (const unsigned char*)in.c_str(), in.size(), (unsigned char*)base64_buf, &base64_len );
     if ( ret != 0 ) {
         std::stringstream err_stream;
@@ -340,7 +340,7 @@ irods::error _base64_easy_encode( std::string in, std::string& out )
     }
     
     out.assign( base64_buf );
-    std::cout << "_base64_easy_encode out: " << out << std::endl;
+    //std::cout << "_base64_easy_encode out: " << out << std::endl;
     return SUCCESS();
 }
 
@@ -366,19 +366,22 @@ irods::error decode_id_token(
         memset( decoded_buf, 0, decoded_len + 1 );
 
         // base64_decode requires data to be padded to 4 byte multiples
-        short pad_n = segment.size() % 4;
-        for ( short i = 0; i < pad_n; i++ ) {
-            segment.append("=");
+        if ( segment.size() % 4 != 0 ) {
+            short pad_n = 4 - (segment.size() % 4);
+            for ( short i = 0; i < pad_n; i++ ) {
+                segment.append("=");
+            }
         }
-
         int decret = base64_decode( in, segment.size(), decoded_buf, &decoded_len );
         if ( decret != 0 ) {
             std::string err_msg("Base64 decoding failed on ");
             err_msg += segment;
+            std::cout << err_msg << std::endl;
             return ERROR( -1, err_msg );
         }
 
         // put the decoded buffer in the corresponding reference
+        //std::cout << "decoded: " << decoded_buf << std::endl;
         p_arr[i]->assign( (char*)decoded_buf, decoded_len );
     }
     return result;
@@ -501,6 +504,7 @@ irods::error openid_auth_client_response(
             std::string user_name = ptr->user_name() + "#" + ptr->zone_name();
             char username[ MAX_NAME_LEN ];
             strncpy( username, user_name.c_str(), MAX_NAME_LEN );
+            // TODO if no username present, don't even bother calling rcAuthResponse because it will fail for sure
             std::cout << "using user_name: " << user_name << std::endl;
             authResponseInp_t auth_response;
             auth_response.response = response;
@@ -656,7 +660,11 @@ irods::error openid_authorize(
             // decode id_token here instead of in caller, verify nonce field is in the id_token
             // base64 decode the id_token to get profile info from it (name, email)
             std::string header, body;
-            decode_id_token( id_token_base64, &header, &body );
+            ret = decode_id_token( id_token_base64, &header, &body );
+            if ( !ret.ok() ) {
+                std::cout << "failed to decode id_token" << std::endl;
+                return ret;
+            }
             std::cout << "decoded id_token: " << body << std::endl; 
             
             // get Subject from the id_token decoded body
@@ -1133,19 +1141,39 @@ int bind_port( int *portno, int *sock_out )
 /*
     Generates a random alphanumeric string of length len, and puts it in buf_out, overwriting any prior contents.
 */
+int urand( long* out ) {
+    int fd = open( "/dev/urandom", O_RDONLY );
+    if ( fd < 0 ) {
+        return -1;
+    }
+    int rd = read( fd, out, sizeof( long ) );
+    if ( rd <= 0 ) {
+        return -2;
+    }
+    if ( rd != sizeof( long ) ) {
+        return -3;
+    }
+    //out ^ getpid();
+    return 0;
+}
 int generate_nonce( size_t len, std::string& buf_out )
 {
-    srandom( time( NULL ) );
+    // seeding with time(NULL) is not unique enough if two requests are received within one second
     std::string arr = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
     size_t arr_len = arr.size();
     char buf[ len ];
+    long r;
     for ( size_t i = 0; i < len; i++ ) {
-        buf[ i ] = arr[ random() % arr_len ];
+        if ( urand( &r ) < 0 ) {
+            std::cout << "failed to generate random number" << std::endl;
+            return -1;
+        }
+        buf[ i ] = arr[ r % arr_len ];
     }
     buf_out.clear();
     buf_out.append( buf, len );
 
-    std::cout << "generated nonce: " << buf_out << std::endl;
+    //std::cout << "generated nonce: " << buf_out << std::endl;
     return 0;
 }
 
@@ -1576,7 +1604,7 @@ irods::error openid_auth_agent_request(
         if ( nonce_ret < 0 ) {
             return ERROR( nonce_ret, "error generating nonce" );
         }
-        std::cout << "generated auth_nonce: " << nonce << std::endl;
+        std::cout << "generated auth_nonce: " << auth_nonce << std::endl;
 
         std::string auth_state;
         nonce_ret = generate_nonce( 32, auth_state ); // do state/nonce different sizes so easy to see difference
@@ -1867,8 +1895,6 @@ irods::error openid_auth_agent_response(
               == 0 ) {
         authCheckOut->clientPrivLevel = authCheckOut->privLevel;
     }
-    std::cout << "authCheckOut->privLevel = " << authCheckOut->privLevel << std::endl;
-    std::cout << "authCheckOut->clientPrivLevel = " << authCheckOut->clientPrivLevel << std::endl;
 
     status = check_proxy_user_privileges( _ctx.comm(), authCheckOut->privLevel );
 
@@ -1896,7 +1922,8 @@ irods::error openid_auth_agent_response(
         _ctx.comm()->proxyUser.authInfo.authFlag =
             _ctx.comm()->clientUser.authInfo.authFlag = authCheckOut->privLevel;
     }
-
+    std::cout << "proxyUser.authInfo.authFlag = " << _ctx.comm()->proxyUser.authInfo.authFlag << std::endl;
+    std::cout << "clientUser.authInfo.authFlag = " << _ctx.comm()->clientUser.authInfo.authFlag << std::endl;
     free( authCheckOut->serverResponse );
     free( authCheckOut );
     
@@ -1910,9 +1937,9 @@ irods::error openid_auth_agent_verify(
     const char*            _challenge,
     const char*            _user_name,
     const char*            _response ) {
-    std::cout << "entering openid_auth_agent_verify" << std::endl;
+    //std::cout << "entering openid_auth_agent_verify" << std::endl;
 
-    std::cout << "leaving openid_auth_agent_verify" << std::endl;
+    //std::cout << "leaving openid_auth_agent_verify" << std::endl;
     return SUCCESS();
 }
 #endif
@@ -2459,7 +2486,12 @@ int redirect_server()
         
         // TODO need some sort of more complex structure in the map, to store a connection time and TTL
         // so connections that have been waiting around to too long are removed from the listener map and closed
-        listeners.insert( std::pair<std::string,int>( std::string( buf ), conn_sock ) );
+        if ( listeners.find( buf ) != listeners.end() ) {
+            rodsLog( LOG_ERROR, "received callback listener with duplicate state value" );
+        }
+        else {
+            listeners.insert( std::pair<std::string,int>( std::string( buf ), conn_sock ) );
+        }
     }
 
     //ret = unlink( unix_sock_name );
