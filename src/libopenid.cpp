@@ -527,28 +527,57 @@ irods::error openid_auth_client_response(
 #ifdef RODS_SERVER
 static std::string openid_provider_name;
 
-static irods::error _get_server_property(std::string key, std::string& buf) {
-    try {
+static irods::error _get_provider_config( std::string key, boost::any& cfg )
+{
+   try {
         const auto provider_cfg = irods::get_server_property<const std::unordered_map<std::string,boost::any>>(
                             std::vector<std::string>{
                                 irods::CFG_PLUGIN_CONFIGURATION_KW,
                                 "authentication",
                                 "openid",
-                                openid_provider_name});
+                                openid_provider_name} );
         try {
-            std::string value = boost::any_cast<const std::string>(provider_cfg.at(key));
-            buf = value;
+            cfg = provider_cfg.at( key );
         }
         catch( const std::out_of_range& e ) {
             return ERROR( SYS_INVALID_INPUT_PARAM, "Key not found: " + key );
         }
     }
-    catch ( const irods::exception& e) {
-        return irods::error(e);
+    catch ( const irods::exception& e ) {
+        return irods::error( e );
     }
+    return SUCCESS(); 
+}
+
+static irods::error _get_provider_string( std::string key, std::string& buf )
+{
+    boost::any cfg;
+    irods::error ret = _get_provider_config( key, cfg );
+    if ( !ret.ok() ) {
+        return ret;
+    }
+    std::string value = boost::any_cast<const std::string>( cfg );
+    buf = value;
     return SUCCESS();
 }
 
+static irods::error _get_provider_scopes( std::vector<std::string>& scopes_out )
+{
+    boost::any cfg;
+    irods::error ret = _get_provider_config( "scopes", cfg );
+    if ( !ret.ok() ) {
+        return ret;
+    }
+    const auto any_vec = boost::any_cast<const std::vector<boost::any>>( cfg );
+
+    for ( auto it = any_vec.begin(); it != any_vec.end(); ++it ) {
+        const std::string& s = boost::any_cast<const std::string&>( *it );
+        std::cout << "got scope: " << s << std::endl;
+        scopes_out.push_back( s );
+    }
+    //scopes_out = boost::any_cast<std::vector<std::string>>( cfg );
+    return SUCCESS();
+}
 
 irods::error openid_auth_agent_start(
     irods::plugin_context& _ctx,
@@ -577,18 +606,33 @@ irods::error generate_authorization_url( std::string& urlBuf, std::string auth_s
 {
     irods::error ret;
     std::string provider_discovery_url;
-    ret = _get_server_property( "discovery_url", provider_discovery_url );
+    ret = _get_provider_string( "discovery_url", provider_discovery_url );
     if ( !ret.ok() ) return ret;
     std::string client_id;
-    ret = _get_server_property( "client_id", client_id );
+    ret = _get_provider_string( "client_id", client_id );
     if ( !ret.ok() ) return ret;
     std::string redirect_uri;
-    ret = _get_server_property( "redirect_uri", redirect_uri );
+    ret = _get_provider_string( "redirect_uri", redirect_uri );
     if ( !ret.ok() ) return ret;
+    
+    // look up the configured scopes for this provider and build a url param string with them
+    std::vector<std::string> scopes;
+    ret = _get_provider_scopes( scopes );
+    if ( !ret.ok() ) return ret;
+    // require 'openid' scope to be set in provider config. Minimum needed for auth.
+    if ( std::find( scopes.begin(), scopes.end(), "openid" ) == scopes.end() ) {
+        return ERROR( SYS_INVALID_INPUT_PARAM, "Client must authorize the openid scope, but this value was missing from the server's configuration for the client's configured openid provider" );
+    }
+    std::string scope_str;
+    for ( auto it = scopes.begin(); it != scopes.end(); ++it ) {
+        if ( it != scopes.begin() ) {
+            scope_str += "%20";
+        }
+        scope_str += *it;
+    }
 
     std::string authorization_endpoint;
     std::string token_endpoint;
-
     if ( !get_provider_metadata_field( provider_discovery_url, "authorization_endpoint", authorization_endpoint )
          || !get_provider_metadata_field( provider_discovery_url, "token_endpoint", token_endpoint) ) {
         std::cout << "Provider discovery metadata missing fields" << std::endl;
@@ -601,7 +645,7 @@ irods::error generate_authorization_url( std::string& urlBuf, std::string auth_s
     url_stream << "response_type=" << "code";
     url_stream << "&access_type=" << "offline";
     url_stream << "&prompt=" << "login%20consent";
-    url_stream << "&scope=" << "openid%20profile%20email";
+    url_stream << "&scope=" << scope_str;
     url_stream << "&client_id=" << client_id;
     url_stream << "&redirect_uri=" << redirect_uri;
     url_stream << "&nonce=" << auth_nonce; // returned encoded in id_token in access_token response
@@ -623,16 +667,16 @@ irods::error openid_authorize(
     std::cout << "entering openid_authorize" << std::endl;
     irods::error ret; 
     std::string provider_discovery_url;
-    ret = _get_server_property( "discovery_url", provider_discovery_url );
+    ret = _get_provider_string( "discovery_url", provider_discovery_url );
     if ( !ret.ok() ) return ret;
     std::string client_id;
-    ret = _get_server_property( "client_id", client_id );
+    ret = _get_provider_string( "client_id", client_id );
     if ( !ret.ok() ) return ret;
     std::string client_secret;
-    ret = _get_server_property( "client_secret", client_secret );
+    ret = _get_provider_string( "client_secret", client_secret );
     if ( !ret.ok() ) return ret;
     std::string redirect_uri;
-    ret = _get_server_property( "redirect_uri", redirect_uri );
+    ret = _get_provider_string( "redirect_uri", redirect_uri );
     if ( !ret.ok() ) return ret;
     
     std::string token_endpoint;
@@ -1020,7 +1064,7 @@ irods::error refresh_access_token( std::string& access_token, std::string& expir
 {
     irods::error ret = SUCCESS();
     std::string provider_discovery_url;
-    ret = _get_server_property( "discovery_url", provider_discovery_url );
+    ret = _get_provider_string( "discovery_url", provider_discovery_url );
     if ( !ret.ok() ) return ret;
 
     std::string token_endpoint;
@@ -1037,10 +1081,10 @@ irods::error refresh_access_token( std::string& access_token, std::string& expir
     
     // set up the headers for the request
     std::string client_id;
-    ret = _get_server_property( "client_id", client_id );
+    ret = _get_provider_string( "client_id", client_id );
     if ( !ret.ok() ) return ret;
     std::string client_secret;
-    ret = _get_server_property( "client_secret", client_secret );
+    ret = _get_provider_string( "client_secret", client_secret );
     if ( !ret.ok() ) return ret;
     // clientid:clientsecret base64ed into Authorization: Basic header
     std::vector<std::string> headers;
