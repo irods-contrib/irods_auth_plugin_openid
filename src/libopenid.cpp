@@ -55,12 +55,11 @@
 #include <netinet/in.h>
 #include <curl/curl.h>
 #include <boost/algorithm/string.hpp>
-#include <boost/property_tree/json_parser.hpp>
-#include <boost/property_tree/ptree.hpp>
 #include <boost/format.hpp>
 #include "irods_hasher_factory.hpp"
 #include "SHA256Strategy.hpp"
 #include "base64.h"
+#include "jansson.h"
 ///END OPENID includes
 ///DECLARATIONS
 
@@ -79,7 +78,7 @@ static const int requireServerAuth = 0;
 
 static const std::string AUTH_OPENID_SCHEME("openid");
 
-boost::property_tree::ptree *get_provider_metadata( std::string provider_metadata_url );
+json_t *get_provider_metadata( std::string provider_metadata_url );
 
 void send_success( int sockfd );
 int accept_request( std::string state, std::string& code );
@@ -633,6 +632,7 @@ irods::error add_user_metadata( rsComm_t *comm, std::string user_name, std::stri
 
 irods::error generate_authorization_url( std::string& urlBuf, std::string auth_state, std::string auth_nonce )
 {
+    std::cout << "entering generate_authorization_url" << std::endl;
     irods::error ret;
     std::string provider_discovery_url;
     ret = _get_provider_string( "discovery_url", provider_discovery_url );
@@ -662,9 +662,12 @@ irods::error generate_authorization_url( std::string& urlBuf, std::string auth_s
 
     std::string authorization_endpoint;
     std::string token_endpoint;
-    if ( !get_provider_metadata_field( provider_discovery_url, "authorization_endpoint", authorization_endpoint )
-         || !get_provider_metadata_field( provider_discovery_url, "token_endpoint", token_endpoint) ) {
-        std::cout << "Provider discovery metadata missing fields" << std::endl;
+    if ( !get_provider_metadata_field( provider_discovery_url, "authorization_endpoint", authorization_endpoint ) ) {
+        std::cout << "Provider discovery metadata missing field: authorization_endpoint" << std::endl;
+        return ERROR(-1, "Provider discovery metadata missing fields");
+    }
+    if ( !get_provider_metadata_field( provider_discovery_url, "token_endpoint", token_endpoint) ) {
+        std::cout << "Provider discovery metadata missing field: token_endpoint" << std::endl;
         return ERROR(-1, "Provider discovery metadata missing fields");
     }
     
@@ -711,6 +714,7 @@ irods::error openid_authorize(
     std::string token_endpoint;
     std::string authorization_code;
     int retval = accept_request( state, authorization_code );
+    std::cout << "returned from accept_request with authorization_code: " << authorization_code << std::endl;
     if ( retval < 0 ) {
         return ERROR( retval, "error accepting authorization request" );
     }
@@ -737,71 +741,89 @@ irods::error openid_authorize(
             return ERROR( -1, "Error retrieving access token from endpoint" );
         }
         std::cout << "Access token response: " << access_token_response << std::endl;
-        std::stringstream response_stream( access_token_response );
-        boost::property_tree::ptree response_tree;
-        boost::property_tree::read_json( response_stream, response_tree );
-        if ( response_tree.find("access_token") == response_tree.not_found()
-            || response_tree.find("id_token") == response_tree.not_found()
-            || response_tree.find("expires_in") == response_tree.not_found() ) {
-            std::cout << "Token response missing required fields (access_token, expires_in, id_token)" << std::endl;
-            return ERROR( -1, "Token response indicated an error in the request" );
+
+        json_t *root = NULL;
+        json_error_t error;
+        root = json_loads( access_token_response.c_str(), 0, &error );
+
+        json_t *act_obj, *idt_obj, *exp_obj;
+        act_obj = json_object_get( root, "access_token" );
+        idt_obj = json_object_get( root, "id_token" );
+        exp_obj = json_object_get( root, "expires_in" );
+
+        if ( !json_is_string( act_obj ) ) {
+            return ERROR( -1, "Token response missing access_token" );
+        }
+        access_token = json_string_value( act_obj );
+
+        if ( !json_is_string( idt_obj ) ) {
+            return ERROR( -1, "Token response missing id_token" );
+        }
+        std::string id_token_base64 = json_string_value( idt_obj );
+
+        if ( json_is_integer( exp_obj ) ) {
+            expires_in = std::to_string( json_integer_value( exp_obj ) );
+        }
+        else if ( json_is_string( exp_obj ) ) {
+            expires_in = json_string_value( exp_obj );
         }
         else {
-            std::string id_token_base64 = response_tree.get<std::string>("id_token");
-            access_token = response_tree.get<std::string>("access_token");
-            expires_in = response_tree.get<std::string>("expires_in");
-            
-            // decode id_token here instead of in caller, verify nonce field is in the id_token
-            // base64 decode the id_token to get profile info from it (name, email)
-            std::string header, body;
-            ret = decode_id_token( id_token_base64, &header, &body );
-            if ( !ret.ok() ) {
-                std::cout << "failed to decode id_token" << std::endl;
-                return ret;
-            }
-            std::cout << "decoded id_token: " << body << std::endl; 
-            
-            // get Subject from the id_token decoded body
-            boost::property_tree::ptree body_tree;
-            std::stringstream body_stream( body );
-            boost::property_tree::read_json( body_stream, body_tree );
-            if ( body_tree.find( "sub" ) == body_tree.not_found() ) {
-                std::cout << "Subject ID not in the response returned by OIDC Provider" << std::endl;
-                return ERROR( -1, "subject id not in the access token response from the OIDC Provider" );
-            }
-            subject_id = body_tree.get<std::string>( "sub" );
-            std::cout << "subject id: " << subject_id << std::endl;
-            
-            // verify nonce matches that sent by us on the intial authorization request 
-            if ( body_tree.find( "nonce" ) == body_tree.not_found()
-                 || body_tree.get<std::string>( "nonce" ).compare( nonce ) != 0 ) {
-                // this id_token response is not from our token request
-                // possible replay or man-in-the-middle attack
-                rodsLog( LOG_ERROR, "Possible replay attack detected against subject [%s]", subject_id.c_str() );
-                return ERROR( -1, "Token request returned invalid response" );
-            }
-            
-            if ( response_tree.find("refresh_token") == response_tree.not_found() ) {
-                // This doesn't break the system, is just an inconvenience
-                // it means the OIDC Provider does not implement the refresh token mechanism
-                refresh_token = "";
-                rodsLog( LOG_WARNING, "Access token response did not contain a refresh token" );
-            }
-            else {
-                refresh_token = response_tree.get<std::string>("refresh_token");
-            }
-
-            // Globus Auth does not strictly follow OpenID specification for access_tokens
-            // TODO store additional access tokens, associated with their scopes
-            if ( openid_provider_name.compare( "globus" ) ) {
-                if ( body_tree.find( "other_tokens" ) != body_tree.not_found() ) {
-                    // there are access_tokens for specific scopes requested in the authorization
-                    // TODO
-                }
-            }
-            // TODO validate
-            // https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation
+            return ERROR( -1, "Token response missing expires_in" );
         }
+
+        // decode id_token here instead of in caller, verify nonce field is in the id_token
+        // base64 decode the id_token to get profile info from it (name, email)
+        std::string header, body;
+        ret = decode_id_token( id_token_base64, &header, &body );
+        if ( !ret.ok() ) {
+            std::cout << "failed to decode id_token" << std::endl;
+            return ret;
+        }
+        std::cout << "decoded id_token: " << body << std::endl;
+
+        // get Subject from the id_token decoded body
+        json_error_t body_error;
+        json_t *body_root = json_loads( body.c_str(), 0, &body_error );
+        json_t *sub_obj = json_object_get( body_root, "sub" );
+        if ( !json_is_string( sub_obj ) ) {
+            std::cout << "Subject ID not in the response returned by OIDC Provider" << std::endl;
+            return ERROR( -1, "subject id not in the access token response from the OIDC Provider" );
+        }
+        subject_id = json_string_value( sub_obj );
+        std::cout << "subject id: " << subject_id << std::endl;
+
+        // verify nonce matches that sent by us on the intial authorization request
+        json_t *nonce_obj = json_object_get( body_root, "nonce" );
+        if ( !json_is_string( nonce_obj )
+             || std::string( json_string_value( nonce_obj ) ).compare( nonce ) != 0 ) {
+            // this id_token response is not from our token request
+            // possible replay or man-in-the-middle attack
+            rodsLog( LOG_ERROR, "Possible replay attack detected against subject [%s]", subject_id.c_str() );
+            return ERROR( -1, "Token request returned invalid response" );
+        }
+
+        json_t *refresh_token_obj = json_object_get( body_root, "refresh_token" );
+        if ( !json_is_string( refresh_token_obj ) ) {
+            // This doesn't break the system, is just an inconvenience
+            // it means the OIDC Provider does not implement the refresh token mechanism
+            refresh_token = "";
+            rodsLog( LOG_WARNING, "Access token response did not contain a refresh token" );
+        }
+        else {
+            refresh_token = json_string_value( refresh_token_obj );
+        }
+
+        // Globus Auth does not strictly follow OpenID specification for access_tokens
+        // TODO store additional access tokens, associated with their scopes
+        if ( openid_provider_name.compare( "globus" ) ) {
+            json_t *other_tokens_obj = json_object_get( body_root, "other_tokens" );
+            if ( json_is_array( other_tokens_obj ) ) {
+                // there are access_tokens for specific scopes requested in the authorization
+                // TODO
+            }
+        }
+        // TODO validate
+        // https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation
     }
     else {
         return ERROR(-1, "Redirect callback missing required params");
@@ -1145,25 +1167,41 @@ irods::error refresh_access_token( std::string& access_token, std::string& expir
     }
 
     // parse response
-    std::stringstream response_stream(response);
-    boost::property_tree::ptree response_tree;
-    boost::property_tree::read_json(response_stream, response_tree);
-    if ( response_tree.find( "access_token" ) == response_tree.not_found()
-         || response_tree.find( "expires_in" ) == response_tree.not_found() ) {
+    json_error_t error;
+    json_t *root = json_loads( response.c_str(), 0, &error );
+    json_t *access_token_obj = json_object_get( root, "access_token" );
+    json_t *expires_obj = json_object_get( root, "expires_in" );
+
+    if ( !json_is_string( access_token_obj ) ) {
         std::stringstream err_stream;
-        err_stream << "Token refresh response missing required fields (access_token, expires_in):" << std::endl;
+        err_stream << "Token refresh response missing access_token field" << std::endl;
         err_stream << response << std::endl;
         return ERROR( -1, err_stream.str() );
     }
+
+    long expires_in;
+    if ( json_is_integer( expires_obj ) ) {
+        expires_in = json_integer_value( expires_obj );
+    }
+    else if ( json_is_string( expires_obj ) ) {
+        // handle expires_in being returned as a string representation of an integer
+        expires_in = std::stol( json_string_value( expires_obj ), NULL, 10 );
+    }
+    else {
+        std::stringstream err_stream;
+        err_stream << "Token refresh response missing expires_in field" << std::endl;
+        err_stream << response << std::endl;
+        return ERROR( -1, err_stream.str() );
+    }
+
     std::string old_acc_tok( access_token );
-    access_token.assign( response_tree.get<std::string>( "access_token" ) );
+    access_token.assign( json_string_value( access_token_obj ) );
 
     // get actual expiry
     char time_buf[50];
     memset( time_buf, 0, 50 );
     getNowStr( time_buf );
     long now = atol( time_buf );
-    long expires_in = std::stol( response_tree.get<std::string>( "expires_in" ), NULL, 10 );
     snprintf( time_buf, 50, "%ld", ( now + expires_in ) );
     expiry.assign( time_buf );
     
@@ -2154,25 +2192,47 @@ void send_success(int sockfd)
 }
 
 /* Given a fully qualified url to a discovery document for an OpenID Identity Provider,
- * send a GET request for that document and put it into a boost ptree.
+ * send a GET request for that document and put it in a json_t object from jansson library.
  */
-boost::property_tree::ptree *get_provider_metadata(std::string provider_metadata_url)
+// TODO agents are separate processes, could use shared memory, or not care about having to look up the metadata each time
+static std::map<std::string,std::string> provider_discovery_metadata_cache;
+json_t *get_provider_metadata( std::string url )
 {
-    std::cout << "get_provider_metadata: " << provider_metadata_url << std::endl;
-    boost::property_tree::ptree *metadata_tree = new boost::property_tree::ptree();
-    std::string params = "";
-    std::string *metadata_string = curl_get(provider_metadata_url, &params);
-    if ( metadata_string->size() == 0 ) {
-        std::cout << "no metadata returned" << std::endl;
-        delete metadata_tree;
+    std::cout << "get_provider_metadata: " << url << std::endl;
+
+    json_t *root;
+    json_error_t error;
+    std::string metadata_string;
+
+    if ( provider_discovery_metadata_cache.find( url ) == provider_discovery_metadata_cache.end() ) {
+        std::string params = "";
+        std::string *curl_resp = curl_get( url, &params );
+        if ( !curl_resp || curl_resp->size() == 0 ) {
+            std::cout << "no metadata returned" << std::endl;
+            if ( curl_resp != NULL ) {
+                delete curl_resp;
+            }
+            return NULL;
+        }
+        metadata_string = *curl_resp;
+        provider_discovery_metadata_cache.insert( std::pair<std::string,std::string>( url, *curl_resp ) );
+        delete curl_resp;
+    }
+    else {
+        metadata_string = provider_discovery_metadata_cache.at( url );
+    }
+
+    root = json_loads( metadata_string.c_str(), 0, &error );
+    if ( !root ) {
+        rodsLog( LOG_ERROR, "Could not parse provider metadata response" );
+        // TODO look at error struct
         return NULL;
     }
 
-    std::cout << "Provider metadata: " << std::endl << *metadata_string << std::endl;
-    std::stringstream metadata_stream(*metadata_string);
-    
-    boost::property_tree::read_json(metadata_stream, *metadata_tree);
-   
+    char *dumps = json_dumps( root, JSON_INDENT(2) );
+    std::cout << "Provider metadata: " << std::endl << dumps << std::endl;
+    free( dumps );
+
     const char *required_fields[] = {
         "issuer",
         "authorization_endpoint",
@@ -2182,45 +2242,41 @@ boost::property_tree::ptree *get_provider_metadata(std::string provider_metadata
         "response_types_supported",
         "claims_supported"};
     std::vector<std::string> metadata_required(required_fields, std::end(required_fields));
-    for (std::vector<std::string>::iterator field_iter = metadata_required.begin(); field_iter != metadata_required.end(); ++field_iter)
-    {
-        if (metadata_tree->find(*field_iter) == metadata_tree->not_found())
-        {
-            std::cout << "Metadata tree missing required field: " << *field_iter << std::endl;
-            delete metadata_tree;
-            metadata_tree = NULL;
-            break;
+
+    for ( auto it = metadata_required.begin(); it != metadata_required.end(); ++it ) {
+        json_t *obj = json_object_get( root, (*it).c_str() );
+        if ( !obj ) {
+            rodsLog( LOG_ERROR, "Provider metadata missing required field: %s", (*it).c_str() );
+            return NULL;
         }
     }
  
-    delete metadata_string;
-    return metadata_tree;
+    return root;
 }
 
-// TODO agents are separate processes, could use shared memory, or not care about having to look up the metadata each time
-static std::map<std::string,boost::property_tree::ptree*> provider_discovery_metadata_cache;
-
+/*
+    Currently only works on discovery metadata fields of string type
+*/
 bool get_provider_metadata_field(std::string provider_metadata_url, const std::string fieldname, std::string& value)
 {
-    boost::property_tree::ptree *metadata_tree;
-    if ( provider_discovery_metadata_cache.find(provider_metadata_url) == provider_discovery_metadata_cache.end() ) {
-        metadata_tree = get_provider_metadata(provider_metadata_url);
-        if ( !metadata_tree ) {
-            return false;
-        }
-        provider_discovery_metadata_cache.insert(std::pair<std::string,boost::property_tree::ptree*>(provider_metadata_url, metadata_tree));
+    std::cout << "entering get_provider_metadata_field with fieldname: " << fieldname << std::endl;
+    json_t *root = NULL;
+    root = get_provider_metadata( provider_metadata_url );
+    if ( !root ) {
+        std::cout << "couldn't get metadata" << std::endl;
     }
-    else {
-        metadata_tree = provider_discovery_metadata_cache.at(provider_metadata_url);
+    json_t *obj = json_object_get( root, fieldname.c_str() );
+    if ( !obj ) {
+        std::cout << "json_object_get returned null for " << fieldname << std::endl;
     }
 
-    if (metadata_tree->find(fieldname) != metadata_tree->not_found())
-    {
-        value = metadata_tree->get<std::string>(fieldname);
+    if ( json_is_string( obj ) ) {
+        value = json_string_value( obj );
+        json_decref( obj );
         return true;
     }
-    else
-    {
+    else {
+        std::cout << "json object is not a string" << std::endl;
         return false;
     }
 }
