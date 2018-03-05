@@ -601,6 +601,35 @@ irods::error openid_auth_agent_start(
     return result;
 }
 
+irods::error add_user_metadata( rsComm_t *comm, std::string user_name, std::string metadata_key, std::string metadata_val )
+{
+    // plugins/database/src/db_plugin.cpp:9320 actual call
+    modAVUMetadataInp_t avu_inp;
+    memset( &avu_inp, 0, sizeof( avu_inp ) );
+    std::string operation("add");
+    std::string obj_type("-u");
+    avu_inp.arg0 = const_cast<char*>( operation.c_str() ); // operation
+    avu_inp.arg1 = const_cast<char*>( obj_type.c_str() ); // obj type
+    avu_inp.arg2 = const_cast<char*>( user_name.c_str() ); // username
+
+    avu_inp.arg3 = const_cast<char*>( metadata_key.c_str() ); // key
+
+    avu_inp.arg4 = const_cast<char*>( metadata_val.c_str() ); // value
+
+    // ELEVATE PRIV LEVEL
+    int old_auth_flag = comm->clientUser.authInfo.authFlag;
+    comm->clientUser.authInfo.authFlag = LOCAL_PRIV_USER_AUTH;
+    int avu_ret = rsModAVUMetadata( comm, &avu_inp );
+    std::cout << "rsModAVUMetadata returned: " << avu_ret << std::endl;
+    // RESET PRIV LEVEL
+    comm->clientUser.authInfo.authFlag = old_auth_flag;
+
+    if ( avu_ret < 0 ) {
+        return ERROR( avu_ret, "failed to add metadata for user: " + user_name );
+    }
+    return SUCCESS();
+}
+
 
 irods::error generate_authorization_url( std::string& urlBuf, std::string auth_state, std::string auth_nonce )
 {
@@ -762,6 +791,14 @@ irods::error openid_authorize(
                 refresh_token = response_tree.get<std::string>("refresh_token");
             }
 
+            // Globus Auth does not strictly follow OpenID specification for access_tokens
+            // TODO store additional access tokens, associated with their scopes
+            if ( openid_provider_name.compare( "globus" ) ) {
+                if ( body_tree.find( "other_tokens" ) != body_tree.not_found() ) {
+                    // there are access_tokens for specific scopes requested in the authorization
+                    // TODO
+                }
+            }
             // TODO validate
             // https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation
         }
@@ -864,7 +901,8 @@ irods::error get_username_by_session_id( rsComm_t *comm, std::string session_id,
     return SUCCESS();
 }
 
-irods::error get_subject_id_by_session_id( rsComm_t *comm, std::string session_id, std::string& subject_id ) {
+irods::error get_subject_id_by_session_id( rsComm_t *comm, std::string session_id, std::string& subject_id )
+{
     std::cout << "entering get_subject_id_by_session_id with: " << session_id << std::endl;
     int status;
     genQueryInp_t genQueryInp;
@@ -917,7 +955,6 @@ irods::error get_subject_id_by_session_id( rsComm_t *comm, std::string session_i
 }
 
 
-// TODO don't need refresh token here
 irods::error update_session_state_after_refresh( 
                 rsComm_t *comm,
                 std::string session_id,
@@ -1195,9 +1232,11 @@ int bind_port( int *portno, int *sock_out )
 }
 
 /*
-    Generates a random alphanumeric string of length len, and puts it in buf_out, overwriting any prior contents.
+    Generate a random long. On error return negative, on success return 0.
 */
-int urand( long* out ) {
+int urand( long* out )
+{
+    // note: seeding with time(NULL) is not unique enough if two requests are received within one second
     int fd = open( "/dev/urandom", O_RDONLY );
     if ( fd < 0 ) {
         return -1;
@@ -1209,12 +1248,14 @@ int urand( long* out ) {
     if ( rd != sizeof( long ) ) {
         return -3;
     }
-    //out ^ getpid();
     return 0;
 }
+
+/*
+    Generates a random alphanumeric string of length len, and puts it in buf_out, overwriting any prior contents.
+*/
 int generate_nonce( size_t len, std::string& buf_out )
 {
-    // seeding with time(NULL) is not unique enough if two requests are received within one second
     std::string arr = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
     size_t arr_len = arr.size();
     char buf[ len ];
@@ -1228,8 +1269,6 @@ int generate_nonce( size_t len, std::string& buf_out )
     }
     buf_out.clear();
     buf_out.append( buf, len );
-
-    //std::cout << "generated nonce: " << buf_out << std::endl;
     return 0;
 }
 
@@ -1306,8 +1345,11 @@ void open_write_to_port(
     std::cout << "received nonce from client: " << client_nonce << std::endl;
 
     if ( nonce.compare( client_nonce ) != 0 ) {
-        rodsLog( LOG_WARNING, "Received connection on port %d from client who provided incorrect nonce. Expected [%s] but got [%s]",
-                                *portno, nonce.c_str(), client_nonce.c_str() );
+        rodsLog( LOG_WARNING,
+                 "Received connection on port %d from with invalid nonce. Expected [%s] but got [%s]",
+                 *portno,
+                 nonce.c_str(),
+                 client_nonce.c_str() );
     }
     
     // send 3 messages [url/true, username, session_id]
@@ -1389,21 +1431,8 @@ void open_write_to_port(
             return;
         }
 
-        // plugins/database/src/db_plugin.cpp:9320 actual call
-        modAVUMetadataInp_t avu_inp;
-        memset( &avu_inp, 0, sizeof( avu_inp ) );
-        std::string operation("add");
-        std::string obj_type("-u");
-        avu_inp.arg0 = (char*)operation.c_str(); // operation
-        avu_inp.arg1 = (char*)obj_type.c_str(); // obj type
-        avu_inp.arg2 = (char*)user_name.c_str(); // username
-    
-        size_t prefix_len = strlen( OPENID_USER_METADATA_SESSION_PREFIX );
-        char metadata_key[ prefix_len + MAX_PASSWORD_LEN ];
-        memset( metadata_key, 0, prefix_len + MAX_PASSWORD_LEN );
-        strncpy( metadata_key, OPENID_USER_METADATA_SESSION_PREFIX, prefix_len );
-        strncpy( metadata_key + prefix_len, irods_session_token, strlen( irods_session_token ) );
-        avu_inp.arg3 = metadata_key; // key
+        std::string metadata_key( OPENID_USER_METADATA_SESSION_PREFIX );
+        metadata_key += irods_session_token;
 
         // in metadata entry value field, put a kvp string with access_token and expiry
         irods::kvp_map_t meta_map;
@@ -1426,18 +1455,17 @@ void open_write_to_port(
         snprintf( time_buf, time_buf_len, "%ld", expiry_sec );
         std::string expiry_str( time_buf );
         meta_map["expiry"] = expiry_str;
+        meta_map["provider"] = openid_provider_name;
+        meta_map["scope"] = "openid"; // access_token returned from openid_authorize is always openid scope
         //put into kvp string
         std::string meta_val = irods::escaped_kvp_string( meta_map );
-        avu_inp.arg4 = const_cast<char*>( meta_val.c_str() ); // value
-        
-        // ELEVATE PRIV LEVEL
-        int old_auth_flag = comm->clientUser.authInfo.authFlag;
-        comm->clientUser.authInfo.authFlag = LOCAL_PRIV_USER_AUTH;
-        int avu_ret = rsModAVUMetadata( comm, &avu_inp );
-        std::cout << "rsModAVUMetadata returned: " << avu_ret << std::endl;
-        // RESET PRIV LEVEL
-        comm->clientUser.authInfo.authFlag = old_auth_flag;
-    
+
+        ret = add_user_metadata( comm, user_name, metadata_key, meta_val );
+        if ( !ret.ok() ) {
+            std::cout << "error adding user metadata: " << ret.result() << std::endl;
+            return;
+        }
+
         // write username, not subject id
         msg_len = user_name.size();
         write( conn_sockfd, &msg_len, sizeof( msg_len ) );
@@ -1514,12 +1542,14 @@ irods::error openid_auth_agent_request(
             return PASS( ret );
         }
         std::string session_id = ctx_map[irods::AUTH_PASSWORD_KEY];
-        // TODO fail immediately if invalid. set global field to the value the client requested
+        // TODO fail immediately if provider name is invalid (not in server_config.json).
+        // set global field to the value the client requested
         openid_provider_name = ctx_map["provider"];
         std::cout << "agent request received client session: " << session_id << std::endl;
         if ( session_id.size() == 0 ) {
             // no creds sent from client
             rodsLog( LOG_NOTICE, "Client sent no session id" );
+            authorized = false;
             // fall through to re-authentication code
         }
         else if ( session_id.size() != 0 ) {
@@ -1583,71 +1613,97 @@ irods::error openid_auth_agent_request(
                 irods::kvp_map_t metadata_map;
                 std::string metadata_string( metadata_value );
                 irods::parse_escaped_kvp_string( metadata_string, metadata_map );
-                if ( metadata_map.find( "access_token" ) == metadata_map.end() 
+                if ( metadata_map.find( "provider" ) == metadata_map.end()
+                     || metadata_map.find( "access_token" ) == metadata_map.end()
                      || metadata_map.find( "expiry" ) == metadata_map.end() ) {
                     // maybe just fall through to re-authenticate here, instead of failing
                     return ERROR( -1, "Session state is missing required values" );
                 }
+                std::string provider = metadata_map["provider"];
                 std::string access_token = metadata_map["access_token"];
                 std::string expiry_str = metadata_map["expiry"];
-                size_t time_buf_len = 50;
-                char time_buf[ time_buf_len ];
-                memset( time_buf, 0, time_buf_len );
-                getNowStr( time_buf );
-                long now = atol( time_buf );
-                long expiry = std::stol( expiry_str, NULL, 10 );
-                if ( now >= expiry ) {
-                    rodsLog( LOG_NOTICE, "Access token for session %s is expired, attempting refresh", session_id.c_str() );
-                    // lookup refresh token for this user
-                    std::string user( irods_user );
-                    std::string refresh_token;
-                    ret = get_refresh_token_for_user( _ctx.comm(), user, refresh_token );
 
-                    if ( !ret.ok() || refresh_token.size() <= 0 ) {
-                        // no refresh token associated with this user in our db
-                        rodsLog( LOG_NOTICE, "No refresh token associated with this session:\n%s", ret.result().c_str() );
-                        
-                        authorized = false;
-                    }
-                    else {
-                        ret = refresh_access_token( access_token, expiry_str, refresh_token );
-                        if ( !ret.ok() ) {
-                            // could not obtain new access/refresh token from endpoint
-                            rodsLog( LOG_WARNING, "Could not refresh token for session %s:\n%s", session_id.c_str(), ret.result().c_str() );
+                // if the provider this session was authorized with doesn't match the provider
+                // the client is currently configured to use, require re-authorization
+                if ( provider.compare( openid_provider_name ) != 0 ) {
+                    rodsLog( LOG_WARNING,
+                             "Client attempted authentication with provider [%s] using session from provider [%s]",
+                             openid_provider_name.c_str(),
+                             provider.c_str() );
+                    authorized = false;
+                }
+                else {
+                    size_t time_buf_len = 50;
+                    char time_buf[ time_buf_len ];
+                    memset( time_buf, 0, time_buf_len );
+                    getNowStr( time_buf );
+                    long now = atol( time_buf );
+                    long expiry = std::stol( expiry_str, NULL, 10 );
+                    if ( now >= expiry ) {
+                        rodsLog( LOG_NOTICE,
+                                 "Access token for session %s is expired, attempting refresh",
+                                 session_id.c_str() );
+                        // lookup refresh token for this user
+                        std::string user( irods_user );
+                        std::string refresh_token;
+                        ret = get_refresh_token_for_user( _ctx.comm(), user, refresh_token );
+
+                        if ( !ret.ok() || refresh_token.size() <= 0 ) {
+                            // no refresh token associated with this user in our db
+                            rodsLog( LOG_NOTICE,
+                                     "No refresh token associated with this session:\n%s",
+                                     ret.result().c_str() );
                             authorized = false;
                         }
                         else {
-                            // update the session metadata to reflect this new access_token, expiry, and refresh_token
-                            ret = update_session_state_after_refresh( _ctx.comm(), session_id, irods_user, 
-                                                                      access_token, expiry_str );
+                            ret = refresh_access_token( access_token, expiry_str, refresh_token );
                             if ( !ret.ok() ) {
-                                rodsLog( LOG_ERROR, "Could not update session state in db after refresh" );
-                                return ret;
+                                rodsLog( LOG_WARNING,
+                                         "Could not refresh token for session %s:\n%s",
+                                         session_id.c_str(),
+                                         ret.result().c_str() );
+                                authorized = false;
                             }
                             else {
-                                rodsLog( LOG_NOTICE, "Successfully updated session state for session %s", session_id.c_str() );
-                                write_msg = "true"; // TODO make this better
-                                authorized = true;
+                                // update the session metadata to reflect this new access_token, expiry, and refresh_token
+                                ret = update_session_state_after_refresh( _ctx.comm(), session_id, irods_user,
+                                                                          access_token, expiry_str );
+                                if ( !ret.ok() ) {
+                                    rodsLog( LOG_ERROR,
+                                             "Could not update session state in db after refresh" );
+                                    return ret;
+                                }
+                                else {
+                                    rodsLog( LOG_NOTICE,
+                                             "Successfully updated session state for session %s",
+                                             session_id.c_str() );
+                                    write_msg = "true"; // TODO make this better
+                                    authorized = true;
+                                }
                             }
-                        }
+                        } // end refresh token found
+                    } // end expired access_token
+                    else {
+                        // session is valid and not expired
+                        rodsLog( LOG_NOTICE, "Session is valid" );
+                        write_msg = "true";
+                        authorized = true;
                     }
-                }
-                else {
-                    // session is valid and not expired
-                    rodsLog( LOG_NOTICE, "Session is valid" );
-                    write_msg = "true";
-                    authorized = true;
-                }
-            }
-            
+                } // end provider from client matches provider the session was authorized with
+            } // end one metadata entry found for this session id
         } // end got a session id
         
         /*
             There are 3 nonces in play here.
-            nonce: send back to plugin client, which is used to verify that a connection on secondary comm port is actually that client
-            auth_nonce: used as part of the OIDC spec, sent in authorization request, and returned as part of the id_token in the token response
-            auth_state: used as part of the OIDC spec, send in authorization request, and returned as param on the callback/redirect request 
-                            to us (authorization_code callback)
+            nonce:
+                send back to plugin client.
+                used to verify that a connection on secondary comm port is actually that client
+            auth_nonce:
+                sent as nonce param in authorization request.
+                part of the OIDC spec, returned as part of the id_token in the token response
+            auth_state:
+                sent as state param in authorization request.
+                part of the OIDC spec, returned as state param on the callback request to us (authorization_code callback)
         */
         std::string nonce;
         // this is sent as part of irods rpc, careful about size TODO check for constraints on this size
@@ -1688,7 +1744,15 @@ irods::error openid_auth_agent_request(
         std::unique_lock<std::mutex> lock(port_mutex);
         port_opened = false;
         rodsLog( LOG_NOTICE, "Starting write thread" );
-        write_thread = new std::thread( open_write_to_port, _ctx.comm(), &portno, nonce, auth_state, auth_nonce, write_msg, session_id ); 
+        write_thread = new std::thread(
+                            open_write_to_port,
+                            _ctx.comm(),
+                            &portno,
+                            nonce,
+                            auth_state,
+                            auth_nonce,
+                            write_msg,
+                            session_id );
         while ( !port_opened ) {
             port_is_open_cond.wait(lock);
             std::cout << "cond woke up" << std::endl;
