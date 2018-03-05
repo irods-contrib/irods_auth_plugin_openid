@@ -288,6 +288,13 @@ irods::error openid_auth_client_start(
 
             // set the socket from the conn
             ptr->sock( _comm->sock );
+
+            // set the provider config to use, must match a provider configured on server
+            irods::kvp_map_t ctx_map;
+            std::string client_provider_cfg = irods::get_environment_property<std::string&>("openid_provider");
+            ctx_map["provider"] = client_provider_cfg;
+
+            // set existing session id from pw file if exists
             char pwBuf[MAX_PASSWORD_LEN + 1];
             memset( pwBuf, 0, MAX_PASSWORD_LEN + 1);
             int getPwError = obfGetPw( pwBuf );
@@ -296,14 +303,13 @@ irods::error openid_auth_client_start(
             }
             else {
                 std::cout << "Password file contains: " << pwBuf << std::endl;
-                
                 // set the password in the context string
-                irods::kvp_map_t ctx_map;
                 ctx_map[irods::AUTH_PASSWORD_KEY] = pwBuf;
-                std::string new_context_str = irods::escaped_kvp_string( ctx_map );
-                std::cout << "setting context: " << new_context_str << std::endl;
-                ptr->context( new_context_str );
             }
+
+            std::string new_context_str = irods::escaped_kvp_string( ctx_map );
+            std::cout << "setting context: " << new_context_str << std::endl;
+            ptr->context( new_context_str );
             
         }
     }
@@ -435,6 +441,7 @@ irods::error openid_auth_client_request(
     
     irods::kvp_map_t out_map;
     irods::parse_escaped_kvp_string( req_out->result_, out_map );
+    printf( "received result from rcAuthPluginRequest: port: %s, nonce: %s\n", out_map["port"].c_str(), out_map["nonce"].c_str() );
     int portno = std::stoi( out_map["port"] );
     std::string nonce = out_map["nonce"]; // 
     std::cout << "received port from server: " << portno << std::endl;
@@ -518,9 +525,23 @@ irods::error openid_auth_client_response(
 }
 
 #ifdef RODS_SERVER
+static std::string openid_provider_name;
+
 static irods::error _get_server_property(std::string key, std::string& buf) {
     try {
-        buf = irods::get_server_property<std::string&>(key);
+        const auto provider_cfg = irods::get_server_property<const std::unordered_map<std::string,boost::any>>(
+                            std::vector<std::string>{
+                                irods::CFG_PLUGIN_CONFIGURATION_KW,
+                                "authentication",
+                                "openid",
+                                openid_provider_name});
+        try {
+            std::string value = boost::any_cast<const std::string>(provider_cfg.at(key));
+            buf = value;
+        }
+        catch( const std::out_of_range& e ) {
+            return ERROR( SYS_INVALID_INPUT_PARAM, "Key not found: " + key );
+        }
     }
     catch ( const irods::exception& e) {
         return irods::error(e);
@@ -556,13 +577,13 @@ irods::error generate_authorization_url( std::string& urlBuf, std::string auth_s
 {
     irods::error ret;
     std::string provider_discovery_url;
-    ret = _get_server_property( "openid_provider_discovery_url", provider_discovery_url );
+    ret = _get_server_property( "discovery_url", provider_discovery_url );
     if ( !ret.ok() ) return ret;
     std::string client_id;
-    ret = _get_server_property( "openid_client_id", client_id );
+    ret = _get_server_property( "client_id", client_id );
     if ( !ret.ok() ) return ret;
     std::string redirect_uri;
-    ret = _get_server_property( "openid_redirect_uri", redirect_uri );
+    ret = _get_server_property( "redirect_uri", redirect_uri );
     if ( !ret.ok() ) return ret;
 
     std::string authorization_endpoint;
@@ -602,16 +623,16 @@ irods::error openid_authorize(
     std::cout << "entering openid_authorize" << std::endl;
     irods::error ret; 
     std::string provider_discovery_url;
-    ret = _get_server_property( "openid_provider_discovery_url", provider_discovery_url );
+    ret = _get_server_property( "discovery_url", provider_discovery_url );
     if ( !ret.ok() ) return ret;
     std::string client_id;
-    ret = _get_server_property( "openid_client_id", client_id );
+    ret = _get_server_property( "client_id", client_id );
     if ( !ret.ok() ) return ret;
     std::string client_secret;
-    ret = _get_server_property( "openid_client_secret", client_secret );
+    ret = _get_server_property( "client_secret", client_secret );
     if ( !ret.ok() ) return ret;
     std::string redirect_uri;
-    ret = _get_server_property( "openid_redirect_uri", redirect_uri );
+    ret = _get_server_property( "redirect_uri", redirect_uri );
     if ( !ret.ok() ) return ret;
     
     std::string token_endpoint;
@@ -764,19 +785,13 @@ irods::error get_username_by_session_id( rsComm_t *comm, std::string session_id,
     addInxIval( &genQueryInp.selectInp, COL_USER_NAME, 1 );
     //addInxIval( &genQueryInp.selectInp, COL_USER_DN, 1 );
 
-    // where meta for user matches prefix OPENID_USER_METADATA_SESSION_PREFIX
+    // where meta attr name for user matches prefix OPENID_USER_METADATA_SESSION_PREFIX
     std::string w1;
     w1 = "='";
     w1 += OPENID_USER_METADATA_SESSION_PREFIX;
     w1 += session_id;
     w1 += "'";
-    std::cout << "looking for metadata key: " << w1 << std::endl;
     addInxVal( &genQueryInp.sqlCondInp, COL_META_USER_ATTR_NAME, w1.c_str() );
-
-    // select col_user_dn* from r_meta_main, r_objt_metamap, r_user_main
-    // where r_meta_main.meta_id = r_objt_metamap.meta_id AND
-    // r_objt_metamap.object_id = r_user_main.user_id; 
-    // join on r_objt_metamap.meta_id
 
     genQueryInp.maxRows = 2;
 
@@ -797,9 +812,8 @@ irods::error get_username_by_session_id( rsComm_t *comm, std::string session_id,
     char *attr_value = genQueryOut->sqlResult[1].value;
     char *user_buf = genQueryOut->sqlResult[2].value;
     //char *user_subject = genQueryOut->sqlResult[3].value;
-    char *user_subject = user_buf;
-    printf( "query by session_id returned (attribute,value,user,subject): (%s,%s,%s,%s)\n",
-                attr_name, attr_value, user_buf, user_subject );
+    printf( "query by session_id returned (attribute,value,user,subject): (%s,%s,%s)\n",
+                attr_name, attr_value, user_buf );
     
     user_name->assign( user_buf );
     std::cout << "returning from get_username_by_session_id" << std::endl;
@@ -846,12 +860,12 @@ irods::error get_subject_id_by_session_id( rsComm_t *comm, std::string session_i
         err_stream << "More than one subject id found for session_id: " << session_id;
         return ERROR( -1, err_stream.str() );
     }
-    char *attr_name = genQueryOut->sqlResult[0].value;
-    char *attr_value = genQueryOut->sqlResult[1].value;
-    char *user_name = genQueryOut->sqlResult[2].value;
-    char *user_subject = genQueryOut->sqlResult[3].value;
-    printf( "query by session_id returned (attribute,value,user,subject): (%s,%s,%s,%s)\n",
-                attr_name, attr_value, user_name, user_subject );
+    //char *attr_name = genQueryOut->sqlResult[0].value;
+    //char *attr_value = genQueryOut->sqlResult[1].value;
+    char *user_name = genQueryOut->sqlResult[0].value;
+    char *user_subject = genQueryOut->sqlResult[1].value;
+    printf( "query by session_id returned (user,subject): (%s,%s)\n",
+                user_name, user_subject );
 
     subject_id.assign( user_subject );
     std::cout << "leaving get_subject_id_by_session_id" << std::endl;
@@ -865,8 +879,7 @@ irods::error update_session_state_after_refresh(
                 std::string session_id,
                 std::string user_name,
                 std::string access_token,
-                std::string expiry,
-                std::string refresh_token )
+                std::string expiry )
 {
     rodsLog( LOG_NOTICE, "Updating session state with new access token (sess,user,access_token,expiry,refresh_token)" );
     irods::error ret = SUCCESS();
@@ -887,7 +900,6 @@ irods::error update_session_state_after_refresh(
     irods::kvp_map_t val_map;
     val_map["access_token"] = access_token;
     val_map["expiry"] = expiry;
-    //val_map["refresh_token"] = refresh_token;
     val = irods::escaped_kvp_string( val_map );
     avu_inp.arg4 = const_cast<char*>( val.c_str() );
 
@@ -1008,11 +1020,11 @@ irods::error refresh_access_token( std::string& access_token, std::string& expir
 {
     irods::error ret = SUCCESS();
     std::string provider_discovery_url;
-    ret = _get_server_property("openid_provider_discovery_url", provider_discovery_url);
+    ret = _get_server_property( "discovery_url", provider_discovery_url );
     if ( !ret.ok() ) return ret;
 
     std::string token_endpoint;
-    if ( !get_provider_metadata_field( provider_discovery_url, "token_endpoint", token_endpoint) ) {
+    if ( !get_provider_metadata_field( provider_discovery_url, "token_endpoint", token_endpoint ) ) {
         return ERROR( -1, "Could not lookup token endpoint when attempting refresh" );
     }
     
@@ -1025,10 +1037,10 @@ irods::error refresh_access_token( std::string& access_token, std::string& expir
     
     // set up the headers for the request
     std::string client_id;
-    ret = _get_server_property( "openid_client_id", client_id );
+    ret = _get_server_property( "client_id", client_id );
     if ( !ret.ok() ) return ret;
     std::string client_secret;
-    ret = _get_server_property( "openid_client_secret", client_secret );
+    ret = _get_server_property( "client_secret", client_secret );
     if ( !ret.ok() ) return ret;
     // clientid:clientsecret base64ed into Authorization: Basic header
     std::vector<std::string> headers;
@@ -1458,6 +1470,8 @@ irods::error openid_auth_agent_request(
             return PASS( ret );
         }
         std::string session_id = ctx_map[irods::AUTH_PASSWORD_KEY];
+        // TODO fail immediately if invalid. set global field to the value the client requested
+        openid_provider_name = ctx_map["provider"];
         std::cout << "agent request received client session: " << session_id << std::endl;
         if ( session_id.size() == 0 ) {
             // no creds sent from client
@@ -1561,7 +1575,7 @@ irods::error openid_auth_agent_request(
                         else {
                             // update the session metadata to reflect this new access_token, expiry, and refresh_token
                             ret = update_session_state_after_refresh( _ctx.comm(), session_id, irods_user, 
-                                                                      access_token, expiry_str, refresh_token );
+                                                                      access_token, expiry_str );
                             if ( !ret.ok() ) {
                                 rodsLog( LOG_ERROR, "Could not update session state in db after refresh" );
                                 return ret;
@@ -2431,7 +2445,7 @@ void redirect_server_accept_thread( int request_port, std::map<std::string,int> 
 //TODO config settings
 const int request_port = 8080;
 const int queue_len = 10;
-const char *unix_sock_name = "\0/tmp/irodsoidcipcsock"; //TODO can randomize up to sockaddr_un.sun_path length)
+const char *unix_sock_name = "/tmp/irodsoidcipcsock";
 // end config settings
 int redirect_server()
 {
@@ -2453,11 +2467,11 @@ int redirect_server()
     server_addr.sun_family = AF_UNIX;
     strncpy( server_addr.sun_path, unix_sock_name, sizeof( server_addr.sun_path ) - 1 );
     
-    //ret = unlink( unix_sock_name ); // remove it if it was still there
-    //if ( ret < 0 ) {
-    //    // ignore this error
-    //    perror( "unlink" );
-    //}
+    ret = unlink( unix_sock_name ); // remove it if it was still there
+    if ( ret < 0 ) {
+        // ignore this error
+        perror( "unlink" );
+    }
 
     ret = bind( ipc_sock, (struct sockaddr *)&server_addr, sizeof(server_addr) );
     if ( ret < 0 ) {
@@ -2474,11 +2488,14 @@ int redirect_server()
 
     while ( true ) {
         // accepting listeners, which are irods agent-side plugins waiting for auth-callbacks
-
         int conn_sock = accept( ipc_sock, (struct sockaddr*)&server_addr, &addr_size );
         int msg_len;
         // TODO error handling
         read( conn_sock, &msg_len, sizeof( msg_len ) );
+        if ( msg_len == 0 ) {
+            rodsLog( LOG_NOTICE, "redirect server received empty connection on domain socket" );
+            continue;
+        }
         char buf[msg_len + 1];
         memset( buf, 0, msg_len + 1 );
         read( conn_sock, buf, msg_len );
@@ -2488,17 +2505,43 @@ int redirect_server()
         // so connections that have been waiting around to too long are removed from the listener map and closed
         if ( listeners.find( buf ) != listeners.end() ) {
             rodsLog( LOG_ERROR, "received callback listener with duplicate state value" );
+            close( conn_sock );
         }
         else {
             listeners.insert( std::pair<std::string,int>( std::string( buf ), conn_sock ) );
         }
     }
 
-    //ret = unlink( unix_sock_name );
-    //if ( ret < 0 ) {
-    //    perror( "unlink" );
-    //}
+    ret = unlink( unix_sock_name );
+    if ( ret < 0 ) {
+        perror( "unlink" );
+    }
     return 0;
+}
+
+bool check_redirect_server_running()
+{
+    int sock = socket( AF_UNIX, SOCK_STREAM, 0 );
+    if ( sock < 0 ) return false;
+    struct sockaddr_un addr;
+    memset( &addr, 0, sizeof( sockaddr_un ) );
+    addr.sun_family = AF_UNIX;
+    strncpy( addr.sun_path, unix_sock_name, sizeof( addr.sun_path) - 1 );
+    int connect_ret = connect( sock, (struct sockaddr*)&addr, sizeof( sockaddr_un ) );
+    if ( connect_ret == 0 ) {
+        int len = 0;
+        write( sock, &len, sizeof( int ) );
+        close( sock );
+        return true; 
+    }
+    if ( errno == ECONNREFUSED ) {
+        return false;
+    }
+    else {
+        // some unexpected error case
+        perror( "failed to connect to the redirect server" );
+        return false;
+    }
 }
 
 
@@ -2507,9 +2550,8 @@ int redirect_server()
 */
 int accept_request( std::string state, std::string& code )
 {
-    // check for ipc socket, to see if server is already running, otherwise spin it up
-    struct stat s_buf; // TODO don't like how brittle it is to see if the server is already running
-    bool http_server_running = ( stat( unix_sock_name, &s_buf ) == 0 );
+    // try a connection to the domain socket, if refused, start up the redirect server
+    bool http_server_running = check_redirect_server_running();
     // TODO maybe switch over to regular TCP socket on loopback address
     if ( !http_server_running ) {
         // start the redirect server process
@@ -2529,7 +2571,6 @@ int accept_request( std::string state, std::string& code )
 
     // it is running now
     // wait for up to 30 seconds for redirect server to be up
-
 
     struct sockaddr_un addr;
     int sock = socket( AF_UNIX, SOCK_STREAM, 0 );
@@ -2559,7 +2600,6 @@ int accept_request( std::string state, std::string& code )
         std::this_thread::sleep_for( std::chrono::seconds( 1 ) );
     }
     
-
     // write state (one time code), to identify our plugin agent to the redirect server
     int state_len = state.size();
     write( sock, &state_len, sizeof( state_len ) );
@@ -2568,91 +2608,6 @@ int accept_request( std::string state, std::string& code )
     // this will block for redirect server, until it returns a msg with the authorization code in it
     read_msg( sock, code );
     std::cout << "got code from redirect server: " << code << std::endl;
-    return 0;
-}
-
-/*
-    Wait for a request on port portno, verify parameter "nonce" was set to value nonce.
-
-    Insert into params map the k,v pairs of the param name and the param value.
-
-    On normal success return 0, on error return negative.
-*/
-int accept_request_OLD( int portno, std::string nonce, std::map<std::string,std::string> params_out )
-{
-    
-    std::cout << "accepting request on port " << portno << std::endl;
-    int sockfd, ret;
-    struct sockaddr_in server_address;
-    struct sockaddr_in client_address;
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-
-    memset(&server_address, 0, sizeof(server_address));
-    server_address.sin_family = AF_INET;
-    server_address.sin_addr.s_addr = htonl(INADDR_ANY);
-    server_address.sin_port = htons(portno);
-    ret = bind(sockfd, (struct sockaddr *)&server_address, sizeof(server_address));
-    if ( ret < 0 ) {
-        std::stringstream err_stream;
-        err_stream << "binding to port " << portno << " failed: ";
-        perror( err_stream.str().c_str()  );
-        return ret;
-    }
-    listen(sockfd, 1);
-    std::string *message = new std::string("");
-    
-    // set up connection socket
-    socklen_t socksize = sizeof(client_address);
-    struct timeval timeout_accept;
-    timeout_accept.tv_sec = 30;
-    timeout_accept.tv_usec = 0;
-    fd_set read_fds;
-    FD_ZERO( &read_fds );
-    FD_SET( sockfd, &read_fds );
-    ret = select( sockfd+1, &read_fds, NULL, NULL, &timeout_accept ); // wait for connection for 30 sec
-    if ( ret < 0 ) {
-        perror( "error setting timeout with select" );
-        return ret;
-    }
-    else if ( ret == 0 ) {
-        rodsLog( LOG_NOTICE, "Timeout reached after %d sec while accepting request on port %d", 
-                                timeout_accept.tv_sec, portno );
-        return -1;
-    }
-
-    int conn_sock_fd = accept(sockfd, (struct sockaddr *)&client_address, &socksize);
-    const size_t BUF_LEN = 2048;
-    char buf[BUF_LEN+1]; buf[BUF_LEN] = 0x0;
-    struct timeval timeout_recv;
-    timeout_recv.tv_sec = 5; // after accepting connection, will terminate if no data sent for 5 sec
-    timeout_recv.tv_usec = 0;
-    setsockopt(conn_sock_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout_recv, sizeof(timeout_recv));
-
-    while (1)
-    {
-        int received_len = recv(conn_sock_fd, buf, BUF_LEN, 0);
-        std::cout << "Received " << received_len << std::endl;
-        if (received_len == -1)
-        {
-            // EAGAIN EWOULDBLOCK
-            std::cout << "Timeout reached" << std::endl;
-            send_success(conn_sock_fd);
-            break;
-        }
-        if (received_len == 0)
-        {
-            std::cout << "Closing connection" << std::endl;
-            send_success(conn_sock_fd);
-            close(conn_sock_fd);
-            break;
-        }
-        message->append(buf); 
-    }
-    std::cout << "accepted request: " << *message << std::endl;
-    close(sockfd);
-    //buf = message;
-    //TODO params
-
     return 0;
 }
 
