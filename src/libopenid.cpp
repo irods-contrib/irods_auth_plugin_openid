@@ -118,7 +118,7 @@ std::string *curl_get( std::string url, std::string *fields );
 /*
     Reads bytes from a socket and puts them in msg_out.
 
-    Expects message to be formatted as byte sequences of length: [4][len] 
+    Expects message to be formatted as byte sequences of length: [4][len]
     The first four bytes being the length of the message, followed by the message.
 */
 int read_msg( int sockfd, std::string& msg_out )
@@ -170,7 +170,7 @@ int read_msg( int sockfd, std::string& msg_out )
     followed immediately by the message. Bytes for the length are the raw bytes of an int, in order. (no hton/ntoh)
 
     The first message is the authorization url. This is printed to stdout.  The user must navigate to this url in
-    order to authorize the server to communicate with the OIDC provider. 
+    order to authorize the server to communicate with the OIDC provider.
 
     The server will wait for the callback request from this url.  After receiving the callback, it will read the tokens
     from the request and send the email and a session token in a 2nd and 3rd message respectively.
@@ -192,7 +192,7 @@ void read_from_server( int portno, std::string nonce, std::string& user_name, st
     std::string irods_env_host = irods::get_environment_property<std::string&>("irods_host"); // TODO error check
     server = gethostbyname( irods_env_host.c_str() ); // TODO this only handles hostnames, not IP addresses. ok?
     if ( server == NULL ) {
-        fprintf( stderr, "No host found for host: %s\n", irods_env_host.c_str() ); 
+        fprintf( stderr, "No host found for host: %s\n", irods_env_host.c_str() );
         return;
     }
     memset( &serv_addr, 0, sizeof( serv_addr ) );
@@ -205,7 +205,7 @@ void read_from_server( int portno, std::string nonce, std::string& user_name, st
     }
     //int data_len = 0;
     //int total_bytes = 0;
-    
+
     // write nonce to server to verify that we are the same client that the auth req came from
     int msg_len = nonce.size();
     write( sockfd, &msg_len, sizeof( msg_len ) );
@@ -277,10 +277,10 @@ irods::error openid_auth_client_start(
     if ( ( result = ASSERT_PASS( ret, "Invalid plugin context.") ).ok() ) {
         if ( ( result = ASSERT_ERROR( _comm != NULL, SYS_INVALID_INPUT_PARAM, "Null rcComm_t pointer." ) ).ok() ) {
             irods::generic_auth_object_ptr ptr = boost::dynamic_pointer_cast<irods::generic_auth_object>( _ctx.fco() );
-            
+
             // set the user name from the conn
             ptr->user_name( _comm->proxyUser.userName );
-            
+
             // se the zone name from the conn
             ptr->zone_name( _comm->proxyUser.rodsZone );
 
@@ -309,7 +309,7 @@ irods::error openid_auth_client_start(
             std::string new_context_str = irods::escaped_kvp_string( ctx_map );
             std::cout << "setting context: " << new_context_str << std::endl;
             ptr->context( new_context_str );
-            
+
         }
     }
     std::cout << "leaving openid_auth_client_start" << std::endl;
@@ -338,7 +338,7 @@ irods::error _base64_easy_encode( const char* in, size_t in_len, std::string& ou
         return ERROR( SYS_INVALID_INPUT_PARAM, "Invalid parameters provided to base64 encode" );
     }
     unsigned long base64_len = (int)( in_len * 4/3 + 1);
-    
+
     // include room for pad
     if ( base64_len % 4 != 0 ) {
         base64_len += 4 - ( base64_len % 4 );
@@ -355,7 +355,7 @@ irods::error _base64_easy_encode( const char* in, size_t in_len, std::string& ou
         std::cout << err_stream.str() << std::endl;
         return ERROR( -1, err_stream.str().c_str() );
     }
-    
+
     out.assign( base64_buf );
     return SUCCESS();
 }
@@ -409,7 +409,7 @@ irods::error openid_auth_client_request(
     rcComm_t*              _comm ) {
     std::cout << "entering openid_auth_client_request" << std::endl;
     irods::error ret;
-    
+
     // validate incoming parameters
     if ( !_ctx.valid<irods::generic_auth_object>().ok() ) {
         return ERROR( SYS_INVALID_INPUT_PARAM, "Invalid plugin context." );
@@ -428,7 +428,7 @@ irods::error openid_auth_client_request(
     if ( !context.empty() ) {
         context += irods::kvp_delimiter();
     }
-    context += irods::AUTH_USER_KEY + irods::kvp_association() + ptr->user_name(); 
+    context += irods::AUTH_USER_KEY + irods::kvp_association() + ptr->user_name();
 
     if ( context.size() > MAX_NAME_LEN ) {
         return ERROR( SYS_INVALID_INPUT_PARAM, "context string > max name len" );
@@ -439,7 +439,7 @@ irods::error openid_auth_client_request(
     memset( &req_in, 0, sizeof(req_in) );
     strncpy( req_in.context_, context.c_str(), context.size() + 1 );
 
-    // copy auth scheme to the req in 
+    // copy auth scheme to the req in
     std::string auth_scheme = AUTH_OPENID_SCHEME;
     strncpy( req_in.auth_scheme_, auth_scheme.c_str(), auth_scheme.size() + 1 );
 
@@ -447,16 +447,16 @@ irods::error openid_auth_client_request(
     authPluginReqOut_t *req_out = 0;
     std::cout << "calling rcAuthPluginRequest" << std::endl;
     int status = rcAuthPluginRequest( _comm, &req_in, &req_out );
-    
+
     irods::kvp_map_t out_map;
     irods::parse_escaped_kvp_string( req_out->result_, out_map );
     printf( "received result from rcAuthPluginRequest: port: %s, nonce: %s\n", out_map["port"].c_str(), out_map["nonce"].c_str() );
     int portno = std::stoi( out_map["port"] );
-    std::string nonce = out_map["nonce"]; // 
+    std::string nonce = out_map["nonce"]; //
     std::cout << "received port from server: " << portno << std::endl;
     std::cout << "received nonce from server: " << nonce << std::endl;
 
-    // perform authorization handshake with server 
+    // perform authorization handshake with server
     // server performs authorization, waits for client to authorize via url it returns via socket
     // when client authorizes, server requests a token from OIDC provider and returns email+session token
     std::string user_name, session_token;
@@ -530,7 +530,7 @@ irods::error openid_auth_client_response(
         }
     }
     //std::cout << "leaving openid_auth_client_response" << std::endl;
-    return result; 
+    return result;
 }
 
 #ifdef RODS_SERVER
@@ -555,7 +555,7 @@ static irods::error _get_provider_config( std::string key, boost::any& cfg )
     catch ( const irods::exception& e ) {
         return irods::error( e );
     }
-    return SUCCESS(); 
+    return SUCCESS();
 }
 
 /*
@@ -604,7 +604,7 @@ irods::error openid_auth_agent_start(
     irods::error result = SUCCESS();
     irods::error ret;
     ret = _ctx.valid<irods::generic_auth_object>();
-    
+
     if ( ( result = ASSERT_PASS( ret, "Invalid plugin context" ) ).ok() ) {
         irods::generic_auth_object_ptr ptr = boost::dynamic_pointer_cast<irods::generic_auth_object>( _ctx.fco() );
         // Reset the auth scheme here
@@ -613,7 +613,7 @@ irods::error openid_auth_agent_start(
         }
         //_ctx.comm()->auth_scheme = strdup( AUTH_OPENID_SCHEME.c_str() );
         _ctx.comm()->auth_scheme = NULL;
-        
+
     }
     std::cout << "leaving openid_auth_agent_start" << std::endl;
     return result;
@@ -666,7 +666,7 @@ irods::error generate_authorization_url( std::string& urlBuf, std::string auth_s
     std::string redirect_uri;
     ret = _get_provider_string( "redirect_uri", redirect_uri );
     if ( !ret.ok() ) return ret;
-    
+
     // look up the configured scopes for this provider and build a url param string with them
     std::vector<std::string> scopes;
     ret = _get_provider_scopes( scopes );
@@ -693,7 +693,7 @@ irods::error generate_authorization_url( std::string& urlBuf, std::string auth_s
         std::cout << "Provider discovery metadata missing field: token_endpoint" << std::endl;
         return ERROR(-1, "Provider discovery metadata missing fields");
     }
-    
+
 
     std::ostringstream url_stream;
     url_stream << authorization_endpoint << "?";
@@ -722,7 +722,7 @@ irods::error openid_authorize(
         std::string& access_token_response )
 {
     std::cout << "entering openid_authorize" << std::endl;
-    irods::error ret; 
+    irods::error ret;
     std::string provider_discovery_url;
     ret = _get_provider_string( "discovery_url", provider_discovery_url );
     if ( !ret.ok() ) return ret;
@@ -735,7 +735,7 @@ irods::error openid_authorize(
     std::string redirect_uri;
     ret = _get_provider_string( "redirect_uri", redirect_uri );
     if ( !ret.ok() ) return ret;
-    
+
     std::string token_endpoint;
     std::string authorization_code;
     int retval = accept_request( state, authorization_code );
@@ -743,7 +743,7 @@ irods::error openid_authorize(
     if ( retval < 0 ) {
         return ERROR( retval, "error accepting authorization request" );
     }
- 
+
     if ( !get_provider_metadata_field( provider_discovery_url, "token_endpoint", token_endpoint) ) {
         std::cout << "Provider discovery metadata missing fields" << std::endl;
         return ERROR(-1, "Provider discovery metadata missing fields");
@@ -831,7 +831,7 @@ irods::error handle_access_token_response(
         return ERROR( -1, "Token response missing id_token" );
     }
     std::string id_token_base64 = json_string_value( idt_obj );
-    
+
     std::string expires_in;
     if ( json_is_integer( exp_obj ) ) {
         expires_in = std::to_string( json_integer_value( exp_obj ) );
@@ -873,7 +873,7 @@ irods::error handle_access_token_response(
         rodsLog( LOG_ERROR, "Possible replay attack detected against subject [%s]", subject_id.c_str() );
         return ERROR( -1, "Token request returned invalid response" );
     }
-    
+
     std::string refresh_token;
     json_t *refresh_token_obj = json_object_get( root, "refresh_token" );
     if ( !json_is_string( refresh_token_obj ) ) {
@@ -888,11 +888,11 @@ irods::error handle_access_token_response(
 
         // TODO validate
         // https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation
-    
+
     // this access_token is too long to store as the password (session token),
     // so create one for use in irods, which will map as the key to the actual
     // access_token and any additional information like expiry and per-user refresh_token
-    // SHA-256 will fit within 50 bytes when base64ed (32->42(44 with pad)) 
+    // SHA-256 will fit within 50 bytes when base64ed (32->42(44 with pad))
     char irods_session_token[MAX_PASSWORD_LEN + 1];
     memset( irods_session_token, 0, MAX_PASSWORD_LEN + 1 );
     unsigned long base64_sha256_len = (int)( 32 * 4/3 + 1);
@@ -902,7 +902,7 @@ irods::error handle_access_token_response(
     }
     // include room for null terminator
     base64_sha256_len += 1;
-    
+
     char access_token_sha256[ 33 ];
     _sha256_hash( access_token, access_token_sha256 );
     std::cout << "sha256 token: ";
@@ -910,7 +910,7 @@ irods::error handle_access_token_response(
         printf( "%02X", (unsigned char)access_token_sha256[i] );
     }
     std::cout << std::endl;
-    
+
     std::string access_token_sha256_base64;
     ret = _base64_easy_encode( access_token_sha256, 32, access_token_sha256_base64 );
     if ( !ret.ok() ) {
@@ -921,7 +921,7 @@ irods::error handle_access_token_response(
         printf( "%c", access_token_sha256_base64[i] );
     }
     std::cout << std::endl;
-    
+
     if ( access_token_sha256_base64.size() > MAX_PASSWORD_LEN ) {
         std::cout << "session token was unexpectedly long: " << access_token_sha256_base64 << std::endl;
         access_token_sha256_base64.resize( MAX_PASSWORD_LEN );
@@ -954,7 +954,7 @@ irods::error handle_access_token_response(
         std::cout << "error adding user metadata: " << ret.result() << std::endl;
         return ERROR( -1, "error adding user metadata" );
     }
-    
+
     // set output values
     username_out = user_name;
     session_id_out = irods_session_token;
@@ -964,12 +964,19 @@ irods::error handle_access_token_response(
 
 
 /*
-    Because Globus Auth returns separate access_tokens for authorizations for scopes that span 
+    Because Globus Auth returns separate access_tokens for authorizations for scopes that span
     resource servers (ex: auth/transfer), we need specific code to handle those.
 
     Globus promises that the top-level json object will always be the access_token for the 'openid' scope,
     and the array of other_tokens will always contain the access_token objects for the other scopes not
     accessible from the 'openid' one.
+
+    All of the other_tokens metadata entries will have their key formatted:
+    OPENID_USER_METADATA_SESSION_PREFIX<session_id>_<N>
+
+    Where N is some number.  This is so it can still easily be searched for with a regex, but
+    there are no duplicate metadata keys (attr_name).
+
     https://docs.globus.org/api/auth/reference/#authorization_code_grant_preferred
 */
 irods::error handle_access_token_response_globus(
@@ -982,7 +989,7 @@ irods::error handle_access_token_response_globus(
     std::cout << "entering handle_access_token_response_globus" << std::endl;
     irods::error ret;
     json_error_t error;
-    json_t *root = json_loads( response.c_str(), 0, &error ); 
+    json_t *root = json_loads( response.c_str(), 0, &error );
     bool found_id_token = false;
     std::vector<std::string> other_token_metadata;
     // Globus Auth does not strictly follow OpenID specification for access_tokens
@@ -1040,7 +1047,7 @@ irods::error handle_access_token_response_globus(
                 long expires_in = json_integer_value( expires_in_obj );
                 std::string refresh_token = json_string_value( refresh_token_obj );
                 std::string scope = json_string_value( scope_obj );
-                
+
                 std::string meta_val = build_token_metadata( access_token, refresh_token, std::to_string( expires_in ), scope );
                 other_token_metadata.push_back( meta_val );
             }
@@ -1050,15 +1057,16 @@ irods::error handle_access_token_response_globus(
         std::string errmsg = "openid_provider_name is not globus: " + openid_provider_name;
         rodsLog( LOG_NOTICE, errmsg.c_str() );
     }
-
+    int N = 0;
     // use same metadata key as primary access_token
     std::string metadata_key( OPENID_USER_METADATA_SESSION_PREFIX );
     metadata_key += session_id_out;
     if ( found_id_token && other_token_metadata.size() > 0 ) {
         for ( auto it = other_token_metadata.begin(); it != other_token_metadata.end(); ++it ) {
+            std::string indexed_meta_key = metadata_key + "_" + std::to_string( N++ );
             std::string meta_val = *it;
             std::cout << "adding user metadata: " << metadata_key << ":" << meta_val << std::endl;
-            ret = add_user_metadata( comm, username_out, metadata_key, meta_val );
+            ret = add_user_metadata( comm, username_out, indexed_meta_key, meta_val );
             if ( !ret.ok() ) {
                 std::string errmsg = "Error adding user metadata for globus access token response: " + ret.result();
                 rodsLog( LOG_ERROR, errmsg.c_str() );
@@ -1077,7 +1085,7 @@ irods::error get_username_by_subject_id( rsComm_t *comm, std::string subject_id,
     genQueryInp_t genQueryInp;
     genQueryOut_t *genQueryOut;
     memset( &genQueryInp, 0, sizeof( genQueryInp_t ) );
-    
+
     // select user_id
     addInxIval( &genQueryInp.selectInp, COL_USER_ID, 1 );
     addInxIval( &genQueryInp.selectInp, COL_USER_NAME, 1 );
@@ -1087,10 +1095,10 @@ irods::error get_username_by_subject_id( rsComm_t *comm, std::string subject_id,
     memset( condition1, 0, MAX_NAME_LEN );
     snprintf( condition1, MAX_NAME_LEN, "='%s'", subject_id.c_str() );
     addInxVal( &genQueryInp.sqlCondInp, COL_USER_DN, condition1 );
-    
+
     genQueryInp.maxRows = 2;
     status = rsGenQuery( comm, &genQueryInp, &genQueryOut );
-    
+
     if ( status == CAT_NO_ROWS_FOUND || genQueryOut == NULL ) {
         std::stringstream err_stream;
         err_stream << "No results from rsGenQuery: " << status;
@@ -1143,8 +1151,9 @@ irods::error get_username_by_session_id( rsComm_t *comm, std::string session_id,
         std::cout << err_stream.str() << std::endl;
         return ERROR( status, err_stream.str() );
     }
-    
+
     // do quick sanity check
+    // TODO after removing case where metadata attr_names can be duplicated, this is no longer theoretically possible
     // make sure all of the usernames associated with this session_id are the same
     // if they are not there is something very wrong
     char *attr_name, *attr_value, *user_buf, *q_res;
@@ -1153,7 +1162,7 @@ irods::error get_username_by_session_id( rsComm_t *comm, std::string session_id,
     for ( int i = 0; i < genQueryOut->rowCnt; i++ ) {
         attr_name = genQueryOut->sqlResult[0].value + ( i * genQueryOut->sqlResult[0].len );
         attr_value = genQueryOut->sqlResult[1].value + ( i * genQueryOut->sqlResult[1].len );
-        
+
         q_res = genQueryOut->sqlResult[2].value + ( i * genQueryOut->sqlResult[2].len );
         if ( user_buf == NULL ) {
             user_buf = q_res;
@@ -1165,7 +1174,7 @@ irods::error get_username_by_session_id( rsComm_t *comm, std::string session_id,
         }
     }
     rodsLog( LOG_NOTICE, "query for username by session_id returned: %s", user_buf );
-    
+
     user_name->assign( user_buf );
     std::cout << "returning from get_username_by_session_id" << std::endl;
     return SUCCESS();
@@ -1174,7 +1183,7 @@ irods::error get_username_by_session_id( rsComm_t *comm, std::string session_id,
 
 /*
     Lookup the metadata id (meta_id in r_meta_main) for the openid session with session_id and scope.
-    Those fields should be enought to identify a distinct entry. 
+    Those fields should be enought to identify a distinct entry.
 */
 irods::error get_token_meta_id(
                 rsComm_t *comm,
@@ -1183,6 +1192,7 @@ irods::error get_token_meta_id(
                 std::string scope,
                 std::string& meta_id )
 {
+    std::cout << "entering get_token_meta_id" << std::endl;
     int status;
     genQueryInp_t genQueryInp;
     genQueryOut_t *genQueryOut;
@@ -1233,14 +1243,15 @@ irods::error get_token_meta_id(
         std::cout << err_stream.str() << std::endl;
         return ERROR( -1, err_stream.str() );
     }
-    
+
     char *id = genQueryOut->sqlResult[0].value + ( 0 * genQueryOut->sqlResult[0].len );
     meta_id = id;
+    std::cout << "leaving get_token_meta_id" << std::endl;
     return SUCCESS();
 }
 
 
-irods::error update_session_state_after_refresh( 
+irods::error update_session_state_after_refresh(
                 rsComm_t *comm,
                 std::string session_id,
                 std::string user_name,
@@ -1250,9 +1261,10 @@ irods::error update_session_state_after_refresh(
 {
     rodsLog( LOG_NOTICE, "Updating session state with new access token (sess,user,access_token,expiry,refresh_token)" );
     irods::error ret = SUCCESS();
-    
+
     // execute a metadata update operation on the user
     modAVUMetadataInp_t avu_inp;
+/*
     memset( &avu_inp, 0, sizeof( avu_inp ) );
 
     // delete the existing entry for this session/token combo
@@ -1261,12 +1273,24 @@ irods::error update_session_state_after_refresh(
     if ( !ret.ok() ) {
         return ret;
     }
+    std::cout << "removing metadata entry with meta_id: " << meta_id << std::endl;
+
     std::string operation( "rmi" );
     std::string obj_type( "-u" );
     avu_inp.arg0 = const_cast<char*>( operation.c_str() );
     avu_inp.arg1 = const_cast<char*>( obj_type.c_str() );
     avu_inp.arg2 = const_cast<char*>( user_name.c_str() );
     avu_inp.arg3 = const_cast<char*>( meta_id.c_str() );
+    // note: even though imeta icommand only requires 4 args, the rsModAVUMetadata api requires 5
+    // and will accept the wildcard arg as the last one. If left out it will segfault
+    std::string empty( "" );
+    avu_inp.arg4 = const_cast<char*>( empty.c_str() );
+    avu_inp.arg5 = const_cast<char*>( empty.c_str() );
+    avu_inp.arg6 = const_cast<char*>( empty.c_str() );
+    avu_inp.arg7 = const_cast<char*>( empty.c_str() );
+    avu_inp.arg8 = const_cast<char*>( empty.c_str() );
+    avu_inp.arg9 = const_cast<char*>( empty.c_str() );
+
     // ELEVATE PRIV LEVEL
     int old_auth_flag = comm->clientUser.authInfo.authFlag;
     comm->clientUser.authInfo.authFlag = LOCAL_PRIV_USER_AUTH;
@@ -1277,12 +1301,13 @@ irods::error update_session_state_after_refresh(
     if ( avu_ret < 0 ) {
         return ERROR( avu_ret, "Error deleting old session metadata" );
     }
-    
+    std::cout << "successfully deleted old session metadata" << std::endl;
+    */
 
     // add new entry for this session/token combo
     memset( &avu_inp, 0, sizeof( avu_inp ) );
-    operation = "add"; // use add, not set, so duplicate keys can exist
-    obj_type = "-u";
+    std::string operation = "set"; // use set, overrwrite any metadata entry matching this meta_attr
+    std::string obj_type = "-u";
     avu_inp.arg0 = const_cast<char*>( operation.c_str() ); // operation
     avu_inp.arg1 = const_cast<char*>( obj_type.c_str() ); // obj type
     avu_inp.arg2 = const_cast<char*>( user_name.c_str() ); // username
@@ -1297,21 +1322,23 @@ irods::error update_session_state_after_refresh(
     val_map["expiry"] = expiry;
     val_map["refresh_token"] = refresh_token;
     val_map["scope"] = "openid";
+    val_map["provider"] = openid_provider_name;
     // TODO
     // add "scope" to here, also don't destroy other entries for this session
     val = irods::escaped_kvp_string( val_map );
     avu_inp.arg4 = const_cast<char*>( val.c_str() );
-
+    std::cout << "adding new metadata: " << attr_name << " := " << val << std::endl;
     // ELEVATE PRIV LEVEL
-    old_auth_flag = comm->clientUser.authInfo.authFlag;
+    int old_auth_flag = comm->clientUser.authInfo.authFlag;
     comm->clientUser.authInfo.authFlag = LOCAL_PRIV_USER_AUTH;
-    avu_ret = rsModAVUMetadata( comm, &avu_inp );
+    int avu_ret = rsModAVUMetadata( comm, &avu_inp );
     std::cout << "rsModAVUMetadata returned: " << avu_ret << std::endl;
     // RESET PRIV LEVEL
     comm->clientUser.authInfo.authFlag = old_auth_flag;
     if ( avu_ret < 0 ) {
         return ERROR( avu_ret, "Error adding updated session metadata" );
     }
+    std::cout << "leaving update_session_state_after_refresh" << std::endl;
     return SUCCESS();
 }
 
@@ -1343,7 +1370,7 @@ irods::error set_refresh_token_for_user( rsComm_t *comm, std::string user_name, 
     std::cout << "rsModAVUMetadata returned: " << avu_ret << std::endl;
     // RESET PRIV LEVEL
     comm->clientUser.authInfo.authFlag = old_auth_flag;
-    
+
     if ( avu_ret < 0 ) {
         std::stringstream err_stream;
         err_stream << "Error setting the refresh token for user " << user_name;
@@ -1365,14 +1392,14 @@ irods::error refresh_access_token( std::string& access_token, std::string& expir
     if ( !get_provider_metadata_field( provider_discovery_url, "token_endpoint", token_endpoint ) ) {
         return ERROR( -1, "Could not lookup token endpoint when attempting refresh" );
     }
-    
+
     // set up the data fields which will be posted
     std::string fields;
     fields += "&refresh_token=";
     fields += refresh_token;
     fields += "&grant_type=refresh_token";
     //fields += "&access_type=offline";
-    
+
     // set up the headers for the request
     std::string client_id;
     ret = _get_provider_string( "client_id", client_id );
@@ -1394,7 +1421,7 @@ irods::error refresh_access_token( std::string& access_token, std::string& expir
 
     std::string content_type_header = "Content-Type: application/x-www-form-urlencoded";
     headers.push_back( content_type_header );
-   
+
     // perform curl
     std::string response;
     if ( !curl_post( token_endpoint, &fields, &headers, &response ) ) {
@@ -1439,7 +1466,7 @@ irods::error refresh_access_token( std::string& access_token, std::string& expir
     long now = atol( time_buf );
     snprintf( time_buf, 50, "%ld", ( now + expires_in ) );
     expiry.assign( time_buf );
-    
+
     rodsLog( LOG_NOTICE, "Successfully refreshed access token %s with (access_token, expiry): (%s,%s)",
                             old_acc_tok.c_str(), access_token.c_str(), expiry.c_str() );
     return SUCCESS();
@@ -1547,7 +1574,7 @@ int generate_nonce( size_t len, std::string& buf_out )
 
 /*
     Uses plugin connection to connect to database. Portno is the server port that the client needs to connect to.
-    
+
     portno: pointer to an integer. used in the call to bind_port. If value it points to is 0, will bind to OS assigned port
         and set the value of portno so caller can see the value. Otherwise, it will attempt to bind to that port number.
     nonce: will generate a nonce and set this to be that value. The client must send this to the server as the first message
@@ -1557,8 +1584,8 @@ int generate_nonce( size_t len, std::string& buf_out )
     session_id: if emtpy, will wait for an authorization callback to generate a session id. If not empty, will use it as the
         session id and send it back to client.
 */
-void open_write_to_port( 
-        rsComm_t* comm, int *portno, 
+void open_write_to_port(
+        rsComm_t* comm, int *portno,
         std::string nonce,
         std::string auth_state,
         std::string auth_nonce,
@@ -1614,7 +1641,7 @@ void open_write_to_port(
                  nonce.c_str(),
                  client_nonce.c_str() );
     }
-    
+
     // send 3 messages [url/true, username, session_id]
     if ( session_id.empty() ) {
         std::cout << "starting write for empty session_id" << std::endl;
@@ -1633,7 +1660,7 @@ void open_write_to_port(
         if ( !ret.ok() ) {
             throw std::runtime_error( "authorization failed: " + ret.result() );
         }
-        
+
         if ( openid_provider_name.compare( "globus" ) == 0 ) {
             ret = handle_access_token_response_globus( comm, response_text, auth_nonce, user_name, session_id );
         }
@@ -1651,7 +1678,7 @@ void open_write_to_port(
         write( conn_sockfd, user_name.c_str(), msg_len );
         std::cout << "wrote " << msg_len << " bytes for user_name: " << user_name << std::endl;
 
-        // write session token 
+        // write session token
         msg_len = session_id.size(); // length of token is always the same
         write( conn_sockfd, &msg_len, sizeof( msg_len ) );
         write( conn_sockfd, session_id.c_str(), msg_len );
@@ -1666,7 +1693,7 @@ void open_write_to_port(
         write( conn_sockfd, msg.c_str(), msg_len );
         std::cout << "wrote " << msg_len << " bytes for msg: " << msg << std::endl;
         std::string subject_id, user_name;
-        
+
         irods::error ret = get_username_by_session_id( comm, session_id, &user_name );
         // write back user_name and session token even though client should know them
         //std::string empty_msg;
@@ -1680,7 +1707,7 @@ void open_write_to_port(
         write( conn_sockfd, session_id.c_str(), msg_len );
         std::cout << "wrote " << msg_len << " bytes for irods_session_token: " << session_id << std::endl;
     }
-    
+
     close( conn_sockfd );
     close( sockfd );
     std::cout << "leaving open_write_to_port" << std::endl;
@@ -1690,7 +1717,7 @@ void open_write_to_port(
 }
 
 
-// server receives request from client 
+// server receives request from client
 // called from rsAuthAgentRequest, which is called by rcAuthAgentRequest
 irods::error openid_auth_agent_request(
     irods::plugin_context& _ctx ) {
@@ -1813,7 +1840,7 @@ irods::error openid_auth_agent_request(
                 }
 
                 // parse metadata value, get access token+expiry
-                // metadata should be formatted as kvp: 
+                // metadata should be formatted as kvp:
                 //   access_token=<access_token>;expiry=<expiry_timestamp>;refresh_token=<refresh_token>;scope=<scope>
                 if ( metadata_map.find( "provider" ) == metadata_map.end()
                      || metadata_map.find( "access_token" ) == metadata_map.end()
@@ -1894,7 +1921,7 @@ irods::error openid_auth_agent_request(
                 } // end provider from client matches provider the session was authorized with
             } // end one metadata entry found for this session id
         } // end got a session id
-        
+
         /*
             There are 3 nonces in play here.
             nonce:
@@ -1941,7 +1968,7 @@ irods::error openid_auth_agent_request(
             authorized = false;
             session_id = "";
         }
-        
+
         int portno = 0;
         std::unique_lock<std::mutex> lock(port_mutex);
         port_opened = false;
@@ -1968,7 +1995,7 @@ irods::error openid_auth_agent_request(
         write_thread->detach();
 
     } // end context check
-    
+
     std::cout << "leaving openid_auth_agent_request" << std::endl;
     return SUCCESS();
 }
@@ -2250,7 +2277,7 @@ irods::error openid_auth_agent_response(
     std::cout << "clientUser.authInfo.authFlag = " << _ctx.comm()->clientUser.authInfo.authFlag << std::endl;
     free( authCheckOut->serverResponse );
     free( authCheckOut );
-    
+
     std::cout << "leaving openid_auth_agent_response" << std::endl;
     return SUCCESS();
 
@@ -2414,7 +2441,7 @@ json_t *get_provider_metadata( std::string url )
             return NULL;
         }
     }
- 
+
     return root;
 }
 
@@ -2491,7 +2518,7 @@ int get_params2( std::string req, std::string& map )
 
 /* Takes a GET request string. This is the literal string representation of the request.
  * Looks for the line with the request path, and splits it up into pair<key, value> for each request parameter
- * If the key has no value, the value part of the pair is left as an empty string. 
+ * If the key has no value, the value part of the pair is left as an empty string.
  * Returns a map<string,string> of each request parameter
  */
 int get_params(std::string req, std::map<std::string,std::string>& req_map_out)
@@ -2517,7 +2544,7 @@ int get_params(std::string req, std::map<std::string,std::string>& req_map_out)
                     break;
                 }
                 std::string params = path_params.substr(param_start+1, std::string::npos);
-                
+
                 std::vector<std::string> param_vector;
                 boost::split(param_vector, params, boost::is_any_of("&"), boost::token_compress_on);
                 // iterate over parameters in the request path
@@ -2571,7 +2598,7 @@ bool get_access_token( std::string token_endpoint_url,
     fields << "&grant_type=" << "authorization_code";
     fields << "&access_type=" << "offline"; // for refresh token (not in spec, but google and globus use this)
     std::string *field_str = new std::string(fields.str());
-    
+
     // https://tools.ietf.org/html/rfc6749#section-2.3.1
     // basic auth header with base64 encoded id:password
     std::vector<std::string> headers;
@@ -2585,10 +2612,10 @@ bool get_access_token( std::string token_endpoint_url,
     _base64_easy_encode( creds.c_str(), creds.size(), encoded_creds );
     authorization_header += encoded_creds;
     headers.push_back( authorization_header );
-    
+
     std::string content_type_header = "Content-Type: application/x-www-form-urlencoded";
     headers.push_back( content_type_header );
-    
+
     bool ret = curl_post( token_endpoint_url, field_str, &headers, response);
     delete field_str;
     return ret;
@@ -2757,13 +2784,13 @@ void redirect_server_accept_thread( int request_port, std::map<std::string,int> 
             rodsLog( LOG_ERROR, "Received request on port %d which contained an unrecognized state value [%s]", request_port, state.c_str() );
             continue;
         }
-        
+
         // write the code to the listener socket
         int listener_sockfd = listeners->at( state );
         int code_len = code.size();
         write( listener_sockfd, &code_len, sizeof( code_len ) );
         write( listener_sockfd, code.c_str(), code_len );
-        
+
         // end this listener
         close( listener_sockfd );
         listeners->erase( state );
@@ -2794,7 +2821,7 @@ int redirect_server()
     memset( &server_addr, 0, sizeof( server_addr ) );
     server_addr.sun_family = AF_UNIX;
     strncpy( server_addr.sun_path, unix_sock_name, sizeof( server_addr.sun_path ) - 1 );
-    
+
     ret = unlink( unix_sock_name ); // remove it if it was still there
     if ( ret < 0 ) {
         // ignore this error
@@ -2828,7 +2855,7 @@ int redirect_server()
         memset( buf, 0, msg_len + 1 );
         read( conn_sock, buf, msg_len );
         std::cout << "received callback listener with state identifier: " << buf << std::endl;
-        
+
         // TODO need some sort of more complex structure in the map, to store a connection time and TTL
         // so connections that have been waiting around to too long are removed from the listener map and closed
         if ( listeners.find( buf ) != listeners.end() ) {
@@ -2860,7 +2887,7 @@ bool check_redirect_server_running()
         int len = 0;
         write( sock, &len, sizeof( int ) );
         close( sock );
-        return true; 
+        return true;
     }
     if ( errno == ECONNREFUSED ) {
         return false;
@@ -2927,12 +2954,12 @@ int accept_request( std::string state, std::string& code )
         }
         std::this_thread::sleep_for( std::chrono::seconds( 1 ) );
     }
-    
+
     // write state (one time code), to identify our plugin agent to the redirect server
     int state_len = state.size();
     write( sock, &state_len, sizeof( state_len ) );
     write( sock, state.c_str(), state_len );
-    
+
     // this will block for redirect server, until it returns a msg with the authorization code in it
     read_msg( sock, code );
     std::cout << "got code from redirect server: " << code << std::endl;
