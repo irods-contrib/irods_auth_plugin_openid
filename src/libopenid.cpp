@@ -929,6 +929,7 @@ irods::error handle_access_token_response(
 
     //TODO issue here. When obfSavePw stores the 44byte token client-side, it results in a string longer than 50bytes.
     // temporarily truncating the session_id down to a smaller size
+
     // https://github.com/irods-contrib/irods_auth_plugin_openid/issues/5
     const size_t TRUNCATED_TOKEN_SIZE = 40;
     access_token_sha256_base64.resize( TRUNCATED_TOKEN_SIZE );
