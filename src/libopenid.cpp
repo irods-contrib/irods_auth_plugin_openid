@@ -161,7 +161,7 @@ int read_msg( int sockfd, std::string& msg_out )
         memset( buffer, 0, READ_LEN );
     }
     msg_out = msg;
-    return 0;
+    return total_bytes;
 }
 
 /*
@@ -235,11 +235,13 @@ void read_from_server( int portno, std::string nonce, std::string& user_name, st
     std::cout << "read user_name: " << user_name << std::endl;
 
     // wait for session token now
-    if ( read_msg( sockfd, session_token ) < 0 ) {
+    int len = read_msg( sockfd, session_token );
+    if ( len < 0 ) {
         perror( "error reading session token from server" );
         return;
     }
     std::cout << "read session token: " << session_token << std::endl;
+    std::cout << "session token length: " << len << std::endl;
 
     close( sockfd );
     std::cout << "leaving read_from_server" << std::endl;
@@ -330,9 +332,12 @@ void _sha256_hash( std::string in, char out[33] )
 /*
     Base64 encode a string and put it in the out reference. Handle padding and length nicely.
 */
-irods::error _base64_easy_encode( std::string in, std::string& out )
+irods::error _base64_easy_encode( const char* in, size_t in_len, std::string& out )
 {
-    unsigned long base64_len = (int)( in.size() * 4/3 + 1);
+    if ( !in || in_len == 0 ) {
+        return ERROR( SYS_INVALID_INPUT_PARAM, "Invalid parameters provided to base64 encode" );
+    }
+    unsigned long base64_len = (int)( in_len * 4/3 + 1);
     
     // include room for pad
     if ( base64_len % 4 != 0 ) {
@@ -343,7 +348,7 @@ irods::error _base64_easy_encode( std::string in, std::string& out )
 
     char base64_buf[ base64_len ];
     memset( base64_buf, 0, base64_len );
-    int ret = base64_encode( (const unsigned char*)in.c_str(), in.size(), (unsigned char*)base64_buf, &base64_len );
+    int ret = base64_encode( (const unsigned char*)in, in_len, (unsigned char*)base64_buf, &base64_len );
     if ( ret != 0 ) {
         std::stringstream err_stream;
         err_stream << "base64_encode failed with: " << ret;
@@ -907,7 +912,7 @@ irods::error handle_access_token_response(
     std::cout << std::endl;
     
     std::string access_token_sha256_base64;
-    ret = _base64_easy_encode( std::string( access_token_sha256 ), access_token_sha256_base64 );
+    ret = _base64_easy_encode( access_token_sha256, 32, access_token_sha256_base64 );
     if ( !ret.ok() ) {
         return ret;
     }
@@ -921,6 +926,13 @@ irods::error handle_access_token_response(
         std::cout << "session token was unexpectedly long: " << access_token_sha256_base64 << std::endl;
         access_token_sha256_base64.resize( MAX_PASSWORD_LEN );
     }
+
+    //TODO issue here. When obfSavePw stores the 44byte token client-side, it results in a string longer than 50bytes.
+    // temporarily truncating the session_id down to a smaller size
+    // https://github.com/irods-contrib/irods_auth_plugin_openid/issues/5
+    const size_t TRUNCATED_TOKEN_SIZE = 40;
+    access_token_sha256_base64.resize( TRUNCATED_TOKEN_SIZE );
+
     strncpy( irods_session_token, access_token_sha256_base64.c_str(), access_token_sha256_base64.size() );
     std::cout << "created session token: " << irods_session_token << std::endl;
 
@@ -949,6 +961,16 @@ irods::error handle_access_token_response(
     return SUCCESS();
 }
 
+
+/*
+    Because Globus Auth returns separate access_tokens for authorizations for scopes that span 
+    resource servers (ex: auth/transfer), we need specific code to handle those.
+
+    Globus promises that the top-level json object will always be the access_token for the 'openid' scope,
+    and the array of other_tokens will always contain the access_token objects for the other scopes not
+    accessible from the 'openid' one.
+    https://docs.globus.org/api/auth/reference/#authorization_code_grant_preferred
+*/
 irods::error handle_access_token_response_globus(
         rsComm_t *comm,
         std::string response,
@@ -1148,6 +1170,75 @@ irods::error get_username_by_session_id( rsComm_t *comm, std::string session_id,
     return SUCCESS();
 }
 
+
+/*
+    Lookup the metadata id (meta_id in r_meta_main) for the openid session with session_id and scope.
+    Those fields should be enought to identify a distinct entry. 
+*/
+irods::error get_token_meta_id(
+                rsComm_t *comm,
+                std::string user_name,
+                std::string session_id,
+                std::string scope,
+                std::string& meta_id )
+{
+    int status;
+    genQueryInp_t genQueryInp;
+    genQueryOut_t *genQueryOut;
+    memset( &genQueryInp, 0, sizeof( genQueryInp_t ) );
+
+    // select
+    addInxIval( &genQueryInp.selectInp, COL_META_USER_ATTR_ID, 1 );
+    addInxIval( &genQueryInp.selectInp, COL_META_USER_ATTR_NAME, 1 );
+    addInxIval( &genQueryInp.selectInp, COL_META_USER_ATTR_VALUE, 1 );
+    //addInxIval( &genQueryInp.selectInp, COL_USER_NAME, 1 );
+    //addInxIval( &genQueryInp.selectInp, COL_USER_DN, 1 );
+
+    // where meta attr name for user matches prefix OPENID_USER_METADATA_SESSION_PREFIX
+    std::string w1;
+    w1 = "='";
+    w1 += OPENID_USER_METADATA_SESSION_PREFIX;
+    w1 += session_id;
+    w1 += "'";
+    addInxVal( &genQueryInp.sqlCondInp, COL_META_USER_ATTR_NAME, w1.c_str() );
+
+    std::string w2;
+    w2 = "='";
+    w2 += user_name;
+    w2 += "'";
+    addInxVal( &genQueryInp.sqlCondInp, COL_USER_NAME, w2.c_str() );
+
+    std::string w3;
+    w3 = " like '";
+    w3 += "%scope=" + scope + "%'";
+    addInxVal( &genQueryInp.sqlCondInp, COL_META_USER_ATTR_VALUE, w3.c_str() );
+
+    genQueryInp.maxRows = 2;
+
+    status = rsGenQuery( comm, &genQueryInp, &genQueryOut );
+    if ( status == CAT_NO_ROWS_FOUND || genQueryOut == NULL || genQueryOut->rowCnt == 0 ) {
+        std::stringstream err_stream;
+        err_stream << "No results from rsGenQuery: " << status;
+        std::cout << err_stream.str() << std::endl;
+        return ERROR( status, err_stream.str() );
+    }
+
+    if ( genQueryOut->rowCnt > 1 ) {
+        std::stringstream err_stream;
+        err_stream << "Multiple metadata ids found for (user,sess,scope): (";
+        err_stream << user_name << ",";
+        err_stream << session_id << ",";
+        err_stream << scope << ")";
+        std::cout << err_stream.str() << std::endl;
+        return ERROR( -1, err_stream.str() );
+    }
+    
+    char *id = genQueryOut->sqlResult[0].value + ( 0 * genQueryOut->sqlResult[0].len );
+    meta_id = id;
+    return SUCCESS();
+}
+
+
 irods::error update_session_state_after_refresh( 
                 rsComm_t *comm,
                 std::string session_id,
@@ -1158,11 +1249,39 @@ irods::error update_session_state_after_refresh(
 {
     rodsLog( LOG_NOTICE, "Updating session state with new access token (sess,user,access_token,expiry,refresh_token)" );
     irods::error ret = SUCCESS();
+    
     // execute a metadata update operation on the user
     modAVUMetadataInp_t avu_inp;
     memset( &avu_inp, 0, sizeof( avu_inp ) );
-    std::string operation("set");
-    std::string obj_type("-u");
+
+    // delete the existing entry for this session/token combo
+    std::string meta_id;
+    ret = get_token_meta_id( comm, user_name, session_id, "openid", meta_id );
+    if ( !ret.ok() ) {
+        return ret;
+    }
+    std::string operation( "rmi" );
+    std::string obj_type( "-u" );
+    avu_inp.arg0 = const_cast<char*>( operation.c_str() );
+    avu_inp.arg1 = const_cast<char*>( obj_type.c_str() );
+    avu_inp.arg2 = const_cast<char*>( user_name.c_str() );
+    avu_inp.arg3 = const_cast<char*>( meta_id.c_str() );
+    // ELEVATE PRIV LEVEL
+    int old_auth_flag = comm->clientUser.authInfo.authFlag;
+    comm->clientUser.authInfo.authFlag = LOCAL_PRIV_USER_AUTH;
+    int avu_ret = rsModAVUMetadata( comm, &avu_inp );
+    std::cout << "rsModAVUMetadata returned: " << avu_ret << std::endl;
+    // RESET PRIV LEVEL
+    comm->clientUser.authInfo.authFlag = old_auth_flag;
+    if ( avu_ret < 0 ) {
+        return ERROR( avu_ret, "Error deleting old session metadata" );
+    }
+    
+
+    // add new entry for this session/token combo
+    memset( &avu_inp, 0, sizeof( avu_inp ) );
+    operation = "add"; // use add, not set, so duplicate keys can exist
+    obj_type = "-u";
     avu_inp.arg0 = const_cast<char*>( operation.c_str() ); // operation
     avu_inp.arg1 = const_cast<char*>( obj_type.c_str() ); // obj type
     avu_inp.arg2 = const_cast<char*>( user_name.c_str() ); // username
@@ -1176,18 +1295,21 @@ irods::error update_session_state_after_refresh(
     val_map["access_token"] = access_token;
     val_map["expiry"] = expiry;
     val_map["refresh_token"] = refresh_token;
+    val_map["scope"] = "openid";
+    // TODO
+    // add "scope" to here, also don't destroy other entries for this session
     val = irods::escaped_kvp_string( val_map );
     avu_inp.arg4 = const_cast<char*>( val.c_str() );
 
     // ELEVATE PRIV LEVEL
-    int old_auth_flag = comm->clientUser.authInfo.authFlag;
+    old_auth_flag = comm->clientUser.authInfo.authFlag;
     comm->clientUser.authInfo.authFlag = LOCAL_PRIV_USER_AUTH;
-    int avu_ret = rsModAVUMetadata( comm, &avu_inp );
+    avu_ret = rsModAVUMetadata( comm, &avu_inp );
     std::cout << "rsModAVUMetadata returned: " << avu_ret << std::endl;
     // RESET PRIV LEVEL
     comm->clientUser.authInfo.authFlag = old_auth_flag;
     if ( avu_ret < 0 ) {
-        return ERROR( avu_ret, "Error updating session metadata" );
+        return ERROR( avu_ret, "Error adding updated session metadata" );
     }
     return SUCCESS();
 }
@@ -1265,7 +1387,7 @@ irods::error refresh_access_token( std::string& access_token, std::string& expir
     creds += ":";
     creds += client_secret;
     std::string encoded_creds;
-    _base64_easy_encode( creds, encoded_creds );
+    _base64_easy_encode( creds.c_str(), creds.size(), encoded_creds );
     authorization_header += encoded_creds;
     headers.push_back( authorization_header );
 
@@ -2459,7 +2581,7 @@ bool get_access_token( std::string token_endpoint_url,
     creds += ":";
     creds += client_secret;
     std::string encoded_creds;
-    _base64_easy_encode( creds, encoded_creds );
+    _base64_easy_encode( creds.c_str(), creds.size(), encoded_creds );
     authorization_header += encoded_creds;
     headers.push_back( authorization_header );
     
