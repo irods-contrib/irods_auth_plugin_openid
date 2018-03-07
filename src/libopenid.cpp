@@ -39,7 +39,7 @@
 ///OPENID includes
 // libhttp-parser-dev (ubuntu)
 // http-parser http-parser-devel (centos)
-//#include <http_parser.h> // TODO either finish or delete
+//#include <http_parser.h> //TODO maybe convert custom http parsing in accept_request to use library
 
 #include <sstream>
 #include <map>
@@ -97,10 +97,9 @@ irods::error generate_authorization_url( std::string& urlBuf, std::string auth_s
 irods::error openid_authorize(
         std::string state,
         std::string nonce,
-        std::string& subject_id,
-        std::string& access_token,
-        std::string& expires_in,
-        std::string& refresh_token );
+        std::string& response_body );
+
+irods::error get_username_by_subject_id( rsComm_t *comm, std::string subject_id, std::string& username );
 // OPENID helper methods
 bool curl_post( std::string url, std::string *fields, std::vector<std::string> *headers, std::string *response );
 std::string *curl_get( std::string url, std::string *fields );
@@ -175,10 +174,8 @@ int read_msg( int sockfd, std::string& msg_out )
 
     The server will wait for the callback request from this url.  After receiving the callback, it will read the tokens
     from the request and send the email and a session token in a 2nd and 3rd message respectively.
-
-    TODO refactor the repetitive read code
 */
-void read_from_server( int portno, std::string nonce /*TODO*/,std::string& user_name, std::string& session_token )
+void read_from_server( int portno, std::string nonce, std::string& user_name, std::string& session_token )
 {
     std::cout << "entering read_from_server" << std::endl;
     int sockfd;
@@ -299,6 +296,7 @@ irods::error openid_auth_client_start(
             int getPwError = obfGetPw( pwBuf );
             if ( getPwError || strlen( (const char*)pwBuf ) == 0 ) {
                 std::cout << "No cached password file" << std::endl;
+                std::cout << "obfGetPw returned: " << getPwError << std::endl;
             }
             else {
                 std::cout << "Password file contains: " << pwBuf << std::endl;
@@ -314,6 +312,18 @@ irods::error openid_auth_client_start(
     }
     std::cout << "leaving openid_auth_client_start" << std::endl;
     return result;
+}
+
+
+void _sha256_hash( std::string in, char out[33] )
+{
+    unsigned char buf[33];
+    memset( buf, 0, 33 );
+    SHA256_CTX ctx;
+    SHA256_Init( &ctx );
+    SHA256_Update( &ctx, in.c_str(), in.size() );
+    SHA256_Final( buf, &ctx );
+    memcpy( out, buf, 33 );
 }
 
 
@@ -333,9 +343,6 @@ irods::error _base64_easy_encode( std::string in, std::string& out )
 
     char base64_buf[ base64_len ];
     memset( base64_buf, 0, base64_len );
-    //std::cout << "in: " << in << std::endl;
-    //std::cout << "inlen: " << in.size() << std::endl;
-    //std::cout << "out max len: " << base64_len << std::endl;
     int ret = base64_encode( (const unsigned char*)in.c_str(), in.size(), (unsigned char*)base64_buf, &base64_len );
     if ( ret != 0 ) {
         std::stringstream err_stream;
@@ -345,7 +352,6 @@ irods::error _base64_easy_encode( std::string in, std::string& out )
     }
     
     out.assign( base64_buf );
-    //std::cout << "_base64_easy_encode out: " << out << std::endl;
     return SUCCESS();
 }
 
@@ -386,7 +392,6 @@ irods::error decode_id_token(
         }
 
         // put the decoded buffer in the corresponding reference
-        //std::cout << "decoded: " << decoded_buf << std::endl;
         p_arr[i]->assign( (char*)decoded_buf, decoded_len );
     }
     return result;
@@ -548,6 +553,11 @@ static irods::error _get_provider_config( std::string key, boost::any& cfg )
     return SUCCESS(); 
 }
 
+/*
+    Looks for a server_config.json string corresponding to key, withing hte openid config section.
+    Sets buf to its value.
+    If the config value for key is not a string, returns an error.
+*/
 static irods::error _get_provider_string( std::string key, std::string& buf )
 {
     boost::any cfg;
@@ -560,6 +570,11 @@ static irods::error _get_provider_string( std::string key, std::string& buf )
     return SUCCESS();
 }
 
+/*
+    Looks for an array of strings in the openid config section of the server config, with the key "scopes".
+    Pushes them into the scopes_out vector.  Does not remove existing contents of scopes_out.
+    If no "scopes" key found in this provider's config, returns an error.
+*/
 static irods::error _get_provider_scopes( std::vector<std::string>& scopes_out )
 {
     boost::any cfg;
@@ -574,7 +589,6 @@ static irods::error _get_provider_scopes( std::vector<std::string>& scopes_out )
         std::cout << "got scope: " << s << std::endl;
         scopes_out.push_back( s );
     }
-    //scopes_out = boost::any_cast<std::vector<std::string>>( cfg );
     return SUCCESS();
 }
 
@@ -600,6 +614,10 @@ irods::error openid_auth_agent_start(
     return result;
 }
 
+
+/*
+    Executes an 'imeta add -u <user> <key> <value>' operation.
+*/
 irods::error add_user_metadata( rsComm_t *comm, std::string user_name, std::string metadata_key, std::string metadata_val )
 {
     // plugins/database/src/db_plugin.cpp:9320 actual call
@@ -688,13 +706,15 @@ irods::error generate_authorization_url( std::string& urlBuf, std::string auth_s
 }
 
 
+/*
+    Waits for a request on the configured callback port, parses the authorization code from it.
+    If authorization code is present, performs a request to the token endpoint. Puts the response
+    from the token endpoint in the access_token_response reference.
+*/
 irods::error openid_authorize(
         std::string state,
         std::string nonce,
-        std::string& subject_id,
-        std::string& access_token,
-        std::string& expires_in,
-        std::string& refresh_token )
+        std::string& access_token_response )
 {
     std::cout << "entering openid_authorize" << std::endl;
     irods::error ret; 
@@ -718,18 +738,14 @@ irods::error openid_authorize(
     if ( retval < 0 ) {
         return ERROR( retval, "error accepting authorization request" );
     }
-    //std::map<std::string,std::string> param_map;
-    //get_params( *request_message, param_map );
-    
+ 
     if ( !get_provider_metadata_field( provider_discovery_url, "token_endpoint", token_endpoint) ) {
         std::cout << "Provider discovery metadata missing fields" << std::endl;
         return ERROR(-1, "Provider discovery metadata missing fields");
     }
-    
+
     // check for code in callback
-    if ( authorization_code.size() > 0 /*param_map.find("code") != param_map.end()*/ ) {
-        //std::string authorization_code = param_map.at("code");
-        std::string access_token_response;
+    if ( authorization_code.size() > 0 ) {
         bool token_ret = get_access_token(
                         token_endpoint,
                         authorization_code,
@@ -741,94 +757,293 @@ irods::error openid_authorize(
             return ERROR( -1, "Error retrieving access token from endpoint" );
         }
         std::cout << "Access token response: " << access_token_response << std::endl;
+        return SUCCESS();
+    }
+    return ERROR( -1, "No authorization code in authorization callback" );
+}
 
-        json_t *root = NULL;
-        json_error_t error;
-        root = json_loads( access_token_response.c_str(), 0, &error );
-
-        json_t *act_obj, *idt_obj, *exp_obj;
-        act_obj = json_object_get( root, "access_token" );
-        idt_obj = json_object_get( root, "id_token" );
-        exp_obj = json_object_get( root, "expires_in" );
-
-        if ( !json_is_string( act_obj ) ) {
-            return ERROR( -1, "Token response missing access_token" );
-        }
-        access_token = json_string_value( act_obj );
-
-        if ( !json_is_string( idt_obj ) ) {
-            return ERROR( -1, "Token response missing id_token" );
-        }
-        std::string id_token_base64 = json_string_value( idt_obj );
-
-        if ( json_is_integer( exp_obj ) ) {
-            expires_in = std::to_string( json_integer_value( exp_obj ) );
-        }
-        else if ( json_is_string( exp_obj ) ) {
-            expires_in = json_string_value( exp_obj );
-        }
-        else {
-            return ERROR( -1, "Token response missing expires_in" );
-        }
-
-        // decode id_token here instead of in caller, verify nonce field is in the id_token
-        // base64 decode the id_token to get profile info from it (name, email)
-        std::string header, body;
-        ret = decode_id_token( id_token_base64, &header, &body );
-        if ( !ret.ok() ) {
-            std::cout << "failed to decode id_token" << std::endl;
-            return ret;
-        }
-        std::cout << "decoded id_token: " << body << std::endl;
-
-        // get Subject from the id_token decoded body
-        json_error_t body_error;
-        json_t *body_root = json_loads( body.c_str(), 0, &body_error );
-        json_t *sub_obj = json_object_get( body_root, "sub" );
-        if ( !json_is_string( sub_obj ) ) {
-            std::cout << "Subject ID not in the response returned by OIDC Provider" << std::endl;
-            return ERROR( -1, "subject id not in the access token response from the OIDC Provider" );
-        }
-        subject_id = json_string_value( sub_obj );
-        std::cout << "subject id: " << subject_id << std::endl;
-
-        // verify nonce matches that sent by us on the intial authorization request
-        json_t *nonce_obj = json_object_get( body_root, "nonce" );
-        if ( !json_is_string( nonce_obj )
-             || std::string( json_string_value( nonce_obj ) ).compare( nonce ) != 0 ) {
-            // this id_token response is not from our token request
-            // possible replay or man-in-the-middle attack
-            rodsLog( LOG_ERROR, "Possible replay attack detected against subject [%s]", subject_id.c_str() );
-            return ERROR( -1, "Token request returned invalid response" );
-        }
-
-        json_t *refresh_token_obj = json_object_get( body_root, "refresh_token" );
-        if ( !json_is_string( refresh_token_obj ) ) {
-            // This doesn't break the system, is just an inconvenience
-            // it means the OIDC Provider does not implement the refresh token mechanism
-            refresh_token = "";
-            rodsLog( LOG_WARNING, "Access token response did not contain a refresh token" );
-        }
-        else {
-            refresh_token = json_string_value( refresh_token_obj );
-        }
-
-        // Globus Auth does not strictly follow OpenID specification for access_tokens
-        // TODO store additional access tokens, associated with their scopes
-        if ( openid_provider_name.compare( "globus" ) ) {
-            json_t *other_tokens_obj = json_object_get( body_root, "other_tokens" );
-            if ( json_is_array( other_tokens_obj ) ) {
-                // there are access_tokens for specific scopes requested in the authorization
-                // TODO
-            }
-        }
-        // TODO validate
-        // https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation
+static std::string build_token_metadata(
+        std::string access_token,
+        std::string refresh_token,
+        std::string expires_in,
+        std::string scope )
+{
+    // in metadata entry value field, put a kvp string with access_token and expiry
+    irods::kvp_map_t meta_map;
+    meta_map["access_token"] = access_token;
+    // set refresh token if we got one in the auth callback
+    if ( refresh_token.size() > 0 ) {
+        // got a new refresh token, set it in the db
+        //set_refresh_token_for_user( comm, user_name, refresh_token );
+        meta_map["refresh_token"] = refresh_token;
     }
     else {
-        return ERROR(-1, "Redirect callback missing required params");
+        //meta_map["refresh_token"] = "";
     }
-    std::cout << "leaving openid_authorize" << std::endl;
+    size_t time_buf_len = 50; //magic number, getNowStr limits to 16(15+null)
+    char time_buf[time_buf_len];
+    memset( time_buf, 0, time_buf_len );
+    getNowStr( time_buf );
+    // get expiration time str (now_buf + expires_in)
+    long now_sec = atol( time_buf );
+    long expires_in_sec = std::stol( expires_in, NULL, 10 );
+    long expiry_sec = now_sec + expires_in_sec;
+    memset( time_buf, 0, time_buf_len );
+    snprintf( time_buf, time_buf_len, "%ld", expiry_sec );
+    std::string expiry_str( time_buf );
+    meta_map["expiry"] = expiry_str;
+    meta_map["provider"] = openid_provider_name;
+    meta_map["scope"] = scope;
+    //put into kvp string
+    std::string meta_val = irods::escaped_kvp_string( meta_map );
+    return meta_val;
+}
+
+irods::error handle_access_token_response(
+        rsComm_t *comm,
+        std::string response,
+        std::string nonce, //used to verify this response
+        std::string& username_out,
+        std::string& session_id_out )
+{
+    std::cout << "entering handle_access_token_response" << std::endl;
+    irods::error ret;
+    json_t *root = NULL;
+    json_error_t error;
+    root = json_loads( response.c_str(), 0, &error );
+
+    json_t *act_obj, *idt_obj, *exp_obj;
+    act_obj = json_object_get( root, "access_token" );
+    idt_obj = json_object_get( root, "id_token" );
+    exp_obj = json_object_get( root, "expires_in" );
+
+    if ( !json_is_string( act_obj ) ) {
+        return ERROR( -1, "Token response missing access_token" );
+    }
+    std::string access_token = json_string_value( act_obj );
+
+    if ( !json_is_string( idt_obj ) ) {
+        return ERROR( -1, "Token response missing id_token" );
+    }
+    std::string id_token_base64 = json_string_value( idt_obj );
+    
+    std::string expires_in;
+    if ( json_is_integer( exp_obj ) ) {
+        expires_in = std::to_string( json_integer_value( exp_obj ) );
+    }
+    else if ( json_is_string( exp_obj ) ) {
+        expires_in = json_string_value( exp_obj );
+    }
+    else {
+        return ERROR( -1, "Token response missing expires_in" );
+    }
+
+    // decode id_token here instead of in caller, verify nonce field is in the id_token
+    // base64 decode the id_token to get profile info from it (name, email)
+    std::string header, body;
+    ret = decode_id_token( id_token_base64, &header, &body );
+    if ( !ret.ok() ) {
+        std::cout << "failed to decode id_token" << std::endl;
+        return ret;
+    }
+    std::cout << "decoded id_token: " << body << std::endl;
+
+    // get Subject from the id_token decoded body
+    json_error_t body_error;
+    json_t *body_root = json_loads( body.c_str(), 0, &body_error );
+    json_t *sub_obj = json_object_get( body_root, "sub" );
+    if ( !json_is_string( sub_obj ) ) {
+        std::cout << "Subject ID not in the response returned by OIDC Provider" << std::endl;
+        return ERROR( -1, "subject id not in the access token response from the OIDC Provider" );
+    }
+    std::string subject_id = json_string_value( sub_obj );
+    std::cout << "subject id: " << subject_id << std::endl;
+
+    // verify nonce matches that sent by us on the intial authorization request
+    json_t *nonce_obj = json_object_get( body_root, "nonce" );
+    if ( !json_is_string( nonce_obj )
+         || std::string( json_string_value( nonce_obj ) ).compare( nonce ) != 0 ) {
+        // this id_token response is not from our token request
+        // possible replay or man-in-the-middle attack
+        rodsLog( LOG_ERROR, "Possible replay attack detected against subject [%s]", subject_id.c_str() );
+        return ERROR( -1, "Token request returned invalid response" );
+    }
+    
+    std::string refresh_token;
+    json_t *refresh_token_obj = json_object_get( root, "refresh_token" );
+    if ( !json_is_string( refresh_token_obj ) ) {
+        // This doesn't break the system, is just an inconvenience
+        // it means the OIDC Provider does not implement the refresh token mechanism
+        refresh_token = "";
+        rodsLog( LOG_WARNING, "Access token response did not contain a refresh token" );
+    }
+    else {
+        refresh_token = json_string_value( refresh_token_obj );
+    }
+
+        // TODO validate
+        // https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation
+    
+    // this access_token is too long to store as the password (session token),
+    // so create one for use in irods, which will map as the key to the actual
+    // access_token and any additional information like expiry and per-user refresh_token
+    // SHA-256 will fit within 50 bytes when base64ed (32->42(44 with pad)) 
+    char irods_session_token[MAX_PASSWORD_LEN + 1];
+    memset( irods_session_token, 0, MAX_PASSWORD_LEN + 1 );
+    unsigned long base64_sha256_len = (int)( 32 * 4/3 + 1);
+    // include room for pad
+    if ( base64_sha256_len % 4 != 0 ) {
+        base64_sha256_len += 4 - ( base64_sha256_len % 4 );
+    }
+    // include room for null terminator
+    base64_sha256_len += 1;
+    
+    char access_token_sha256[ 33 ];
+    _sha256_hash( access_token, access_token_sha256 );
+    std::cout << "sha256 token: ";
+    for ( int i = 0; i < 20; i++ ) {
+        printf( "%02X", (unsigned char)access_token_sha256[i] );
+    }
+    std::cout << std::endl;
+    
+    std::string access_token_sha256_base64;
+    ret = _base64_easy_encode( std::string( access_token_sha256 ), access_token_sha256_base64 );
+    if ( !ret.ok() ) {
+        return ret;
+    }
+    std::cout << "base64 encoded: ";
+    for ( unsigned long i = 0; i < access_token_sha256_base64.size(); i++ ) {
+        printf( "%c", access_token_sha256_base64[i] );
+    }
+    std::cout << std::endl;
+    
+    if ( access_token_sha256_base64.size() > MAX_PASSWORD_LEN ) {
+        std::cout << "session token was unexpectedly long: " << access_token_sha256_base64 << std::endl;
+        access_token_sha256_base64.resize( MAX_PASSWORD_LEN );
+    }
+    strncpy( irods_session_token, access_token_sha256_base64.c_str(), access_token_sha256_base64.size() );
+    std::cout << "created session token: " << irods_session_token << std::endl;
+
+    std::string user_name;
+    ret = get_username_by_subject_id( comm, subject_id, user_name );
+    if ( !ret.ok() ) {
+        return ERROR( -1, "error retrieving username from subject id" );
+    }
+
+    std::string metadata_key( OPENID_USER_METADATA_SESSION_PREFIX );
+    metadata_key += irods_session_token;
+
+    // put session token in the server database as user metadata
+    // format: imeta add -u <username> <keyname> <value>
+    std::string meta_val = build_token_metadata( access_token, refresh_token, expires_in, "openid" );
+    ret = add_user_metadata( comm, user_name, metadata_key, meta_val );
+    if ( !ret.ok() ) {
+        std::cout << "error adding user metadata: " << ret.result() << std::endl;
+        return ERROR( -1, "error adding user metadata" );
+    }
+    
+    // set output values
+    username_out = user_name;
+    session_id_out = irods_session_token;
+    std::cout << "leaving handle_access_token_response" << std::endl;
+    return SUCCESS();
+}
+
+irods::error handle_access_token_response_globus(
+        rsComm_t *comm,
+        std::string response,
+        std::string nonce, // used to verify this response
+        std::string& username_out,
+        std::string& session_id_out )
+{
+    std::cout << "entering handle_access_token_response_globus" << std::endl;
+    irods::error ret;
+    json_error_t error;
+    json_t *root = json_loads( response.c_str(), 0, &error ); 
+    bool found_id_token = false;
+    std::vector<std::string> other_token_metadata;
+    // Globus Auth does not strictly follow OpenID specification for access_tokens
+    // store additional access tokens, associated with their scopes
+    if ( openid_provider_name.compare( "globus" ) == 0 ) {
+        if ( json_is_string( json_object_get( root, "id_token" ) ) ) {
+            std::cout << "found id_token" << std::endl;
+            ret = handle_access_token_response( comm, response, nonce, username_out, session_id_out );
+            if ( !ret.ok() ) {
+                return ret;
+            }
+            printf( "returned from standard handle_access_token_response with username: %s, session_id: %s\n",
+                        username_out.c_str(), session_id_out.c_str() );
+            found_id_token = true;
+        }
+        else {
+            // expected id_token to be on the top level access_token, corresponding to openid scope and auth resource
+            std::string errmsg = "Could not parse globus access token response";
+            rodsLog( LOG_ERROR, errmsg.c_str() );
+            return ERROR( -1, errmsg );
+        }
+
+        // loop through other_tokens if they are also in this response
+        json_t *other_tokens_arr = json_object_get( root, "other_tokens" );
+        if ( json_is_array( other_tokens_arr ) ) {
+            // there are access_tokens for specific scopes requested in the authorization
+            std::cout << "parsing other_tokens for globus token response" << std::endl;
+            std::cout << "number of other_tokens: " << json_array_size( other_tokens_arr ) << std::endl;
+            for ( size_t i = 0; i < json_array_size( other_tokens_arr ); i++ ) {
+                json_t *token_obj = json_array_get( other_tokens_arr, i );
+                if ( !json_is_object( token_obj ) ) {
+                    std::cout << "error parsing other_token at index: " << i << std::endl;
+                    continue;
+                }
+                /*if ( json_is_object( json_object_get( token_obj, "id_token" ) ) ) {
+                    char *token_s = json_dumps( token_obj, 0 );
+                    ret = handle_access_token_response( comm, std::string( token_s ), nonce, username_out, session_id_out );
+                    free( token_s );
+                    if ( !ret.ok() ) {
+                        return ret;
+                    }
+                }*/
+                json_t *access_token_obj = json_object_get( token_obj, "access_token" );
+                json_t *expires_in_obj = json_object_get( token_obj, "expires_in" );
+                json_t *refresh_token_obj = json_object_get( token_obj, "refresh_token" );
+                json_t *scope_obj = json_object_get( token_obj, "scope" );
+                if ( !json_is_string( access_token_obj )
+                     || !json_is_integer( expires_in_obj )
+                     || !json_is_string( refresh_token_obj )
+                     || !json_is_string( scope_obj ) ) {
+                    std::cout << "error parsing other_token due to incorrect entry type in object: " << i << std::endl;
+                    continue;
+                }
+                std::string access_token = json_string_value( access_token_obj );
+                long expires_in = json_integer_value( expires_in_obj );
+                std::string refresh_token = json_string_value( refresh_token_obj );
+                std::string scope = json_string_value( scope_obj );
+                
+                std::string meta_val = build_token_metadata( access_token, refresh_token, std::to_string( expires_in ), scope );
+                other_token_metadata.push_back( meta_val );
+            }
+        }
+    } // end parsed through all the tokens
+    else {
+        std::string errmsg = "openid_provider_name is not globus: " + openid_provider_name;
+        rodsLog( LOG_NOTICE, errmsg.c_str() );
+    }
+
+    // use same metadata key as primary access_token
+    std::string metadata_key( OPENID_USER_METADATA_SESSION_PREFIX );
+    metadata_key += session_id_out;
+    if ( found_id_token && other_token_metadata.size() > 0 ) {
+        for ( auto it = other_token_metadata.begin(); it != other_token_metadata.end(); ++it ) {
+            std::string meta_val = *it;
+            std::cout << "adding user metadata: " << metadata_key << ":" << meta_val << std::endl;
+            ret = add_user_metadata( comm, username_out, metadata_key, meta_val );
+            if ( !ret.ok() ) {
+                std::string errmsg = "Error adding user metadata for globus access token response: " + ret.result();
+                rodsLog( LOG_ERROR, errmsg.c_str() );
+                return ERROR( -1, errmsg );
+            }
+        }
+    }
+    std::cout << "leaving handle_access_token_response_globus" << std::endl;
     return SUCCESS();
 }
 
@@ -899,90 +1114,47 @@ irods::error get_username_by_session_id( rsComm_t *comm, std::string session_id,
     genQueryInp.maxRows = 2;
 
     status = rsGenQuery( comm, &genQueryInp, &genQueryOut );
-    if ( status == CAT_NO_ROWS_FOUND || genQueryOut == NULL ) {
+    if ( status == CAT_NO_ROWS_FOUND || genQueryOut == NULL || genQueryOut->rowCnt == 0 ) {
         std::stringstream err_stream;
         err_stream << "No results from rsGenQuery: " << status;
         std::cout << err_stream.str() << std::endl;
         return ERROR( status, err_stream.str() );
     }
-    if ( genQueryOut->rowCnt > 1 ) {
-        std::stringstream err_stream;
-        err_stream << "More than one subject id found for session_id: " << session_id;
-        std::cout << err_stream.str() << std::endl;
-        return ERROR( -1, err_stream.str() );
+    
+    // do quick sanity check
+    // make sure all of the usernames associated with this session_id are the same
+    // if they are not there is something very wrong
+    char *attr_name, *attr_value, *user_buf, *q_res;
+    attr_name = attr_value = user_buf = q_res = NULL;
+
+    for ( int i = 0; i < genQueryOut->rowCnt; i++ ) {
+        attr_name = genQueryOut->sqlResult[0].value + ( i * genQueryOut->sqlResult[0].len );
+        attr_value = genQueryOut->sqlResult[1].value + ( i * genQueryOut->sqlResult[1].len );
+        
+        q_res = genQueryOut->sqlResult[2].value + ( i * genQueryOut->sqlResult[2].len );
+        if ( user_buf == NULL ) {
+            user_buf = q_res;
+        }
+        else if ( strcmp( q_res, user_buf ) != 0 ) {
+            std::string errmsg = "While looking up username by session_id, found multiple users for one session: " + session_id;
+            rodsLog( LOG_ERROR, errmsg.c_str() );
+            return ERROR( SYS_INVALID_INPUT_PARAM, errmsg );
+        }
     }
-    char *attr_name = genQueryOut->sqlResult[0].value;
-    char *attr_value = genQueryOut->sqlResult[1].value;
-    char *user_buf = genQueryOut->sqlResult[2].value;
-    //char *user_subject = genQueryOut->sqlResult[3].value;
-    printf( "query by session_id returned (attribute,value,user,subject): (%s,%s,%s)\n",
-                attr_name, attr_value, user_buf );
+    rodsLog( LOG_NOTICE, "query for username by session_id returned: %s", user_buf );
     
     user_name->assign( user_buf );
     std::cout << "returning from get_username_by_session_id" << std::endl;
     return SUCCESS();
 }
 
-irods::error get_subject_id_by_session_id( rsComm_t *comm, std::string session_id, std::string& subject_id )
-{
-    std::cout << "entering get_subject_id_by_session_id with: " << session_id << std::endl;
-    int status;
-    genQueryInp_t genQueryInp;
-    genQueryOut_t *genQueryOut;
-    memset( &genQueryInp, 0, sizeof( genQueryInp_t ) );
-
-    // select
-    //addInxIval( &genQueryInp.selectInp, COL_META_USER_ATTR_NAME, 0 );
-    //addInxIval( &genQueryInp.selectInp, COL_META_USER_ATTR_VALUE, 0 );
-    addInxIval( &genQueryInp.selectInp, COL_USER_NAME, 0 );
-    addInxIval( &genQueryInp.selectInp, COL_USER_DN, 0 );
-
-    // where meta for user matches prefix OPENID_USER_METADATA_SESSION_PREFIX
-    std::string w1;
-    w1 = "='";
-    w1 += OPENID_USER_METADATA_SESSION_PREFIX;
-    w1 += session_id;
-    w1 += "'";
-    std::cout << "looking for metadata key: " << w1 << std::endl;
-    addInxVal( &genQueryInp.sqlCondInp, COL_META_USER_ATTR_NAME, w1.c_str() );
-    
-    // select col_user_dn* from r_meta_main, r_objt_metamap, r_user_main
-    // where r_meta_main.meta_id = r_objt_metamap.meta_id AND
-    // r_objt_metamap.object_id = r_user_main.user_id; 
-    // join on r_objt_metamap.meta_id
-
-    genQueryInp.maxRows = 2;
-
-    status = rsGenQuery( comm, &genQueryInp, &genQueryOut );
-    if ( status == CAT_NO_ROWS_FOUND || genQueryOut == NULL ) {
-        std::stringstream err_stream;
-        err_stream << "No results from rsGenQuery: " << status;
-        return ERROR( status, err_stream.str() );
-    }
-    if ( genQueryOut->rowCnt > 1 ) {
-        std::stringstream err_stream;
-        err_stream << "More than one subject id found for session_id: " << session_id;
-        return ERROR( -1, err_stream.str() );
-    }
-    //char *attr_name = genQueryOut->sqlResult[0].value;
-    //char *attr_value = genQueryOut->sqlResult[1].value;
-    char *user_name = genQueryOut->sqlResult[0].value;
-    char *user_subject = genQueryOut->sqlResult[1].value;
-    printf( "query by session_id returned (user,subject): (%s,%s)\n",
-                user_name, user_subject );
-
-    subject_id.assign( user_subject );
-    std::cout << "leaving get_subject_id_by_session_id" << std::endl;
-    return SUCCESS();
-}
-
-
 irods::error update_session_state_after_refresh( 
                 rsComm_t *comm,
                 std::string session_id,
                 std::string user_name,
                 std::string access_token,
-                std::string expiry )
+                std::string expiry,
+                std::string refresh_token )
 {
     rodsLog( LOG_NOTICE, "Updating session state with new access token (sess,user,access_token,expiry,refresh_token)" );
     irods::error ret = SUCCESS();
@@ -1003,6 +1175,7 @@ irods::error update_session_state_after_refresh(
     irods::kvp_map_t val_map;
     val_map["access_token"] = access_token;
     val_map["expiry"] = expiry;
+    val_map["refresh_token"] = refresh_token;
     val = irods::escaped_kvp_string( val_map );
     avu_inp.arg4 = const_cast<char*>( val.c_str() );
 
@@ -1055,67 +1228,6 @@ irods::error set_refresh_token_for_user( rsComm_t *comm, std::string user_name, 
     }
     rodsLog( LOG_NOTICE, "refresh token set successfully" );
     return SUCCESS();
-}
-
-
-irods::error get_refresh_token_for_user( rsComm_t *comm, std::string user_name, std::string& refresh_token )
-{
-    rodsLog( LOG_NOTICE, "getting refresh token for user [%s]", user_name.c_str() );
-    irods::error ret = SUCCESS();
-    int status;
-    genQueryInp_t genQueryInp;
-    genQueryOut_t *genQueryOut;
-    memset( &genQueryInp, 0, sizeof( genQueryInp_t ) );
-
-    // select
-    //addInxIval( &genQueryInp.selectInp, COL_META_USER_ATTR_NAME, 0 );
-    addInxIval( &genQueryInp.selectInp, COL_META_USER_ATTR_VALUE, 0 );
-    addInxIval( &genQueryInp.selectInp, COL_USER_NAME, 0 );
-    //addInxIval( &genQueryInp.selectInp, COL_USER_DN, 0 );
-
-    // where meta for user attribute name matches OPENID_USER_METADATA_REFRESH_TOKEN_KEY
-    std::string w1;
-    w1 = "='";
-    w1 += OPENID_USER_METADATA_REFRESH_TOKEN_KEY;
-    w1 += "'";
-    std::cout << "looking for metadata key: " << w1 << std::endl;
-    addInxVal( &genQueryInp.sqlCondInp, COL_META_USER_ATTR_NAME, w1.c_str() );
-
-    // where user matches
-    std::string w2;
-    w2 = "='";
-    w2 += user_name;
-    w2 += "'";
-    addInxVal( &genQueryInp.sqlCondInp, COL_USER_NAME, w2.c_str() ); 
-
-    // select col_user_dn* from r_meta_main, r_objt_metamap, r_user_main
-    // where r_meta_main.meta_id = r_objt_metamap.meta_id AND
-    // r_objt_metamap.object_id = r_user_main.user_id; 
-    // join on r_objt_metamap.meta_id
-
-    genQueryInp.maxRows = 2;
-
-    status = rsGenQuery( comm, &genQueryInp, &genQueryOut );
-    if ( status == CAT_NO_ROWS_FOUND || genQueryOut == NULL ) {
-        std::stringstream err_stream;
-        err_stream << "No results from rsGenQuery: " << status;
-        return ERROR( status, err_stream.str() );
-    }
-    if ( genQueryOut->rowCnt > 1 ) {
-        std::stringstream err_stream;
-        err_stream << "More than one refresh token found for user: " << user_name;
-        return ERROR( -1, err_stream.str() );
-    }
-    //char *attr_name = genQueryOut->sqlResult[0].value;
-    char *attr_value = genQueryOut->sqlResult[0].value;
-    char *u_name = genQueryOut->sqlResult[1].value;
-    //char *user_subject = genQueryOut->sqlResult[3].value;
-    printf( "query by user returned (value,user): (%s,%s)\n",
-                attr_value, u_name );
-    rodsLog( LOG_NOTICE, "user [%s] has refresh token [%s]\n", user_name.c_str(), attr_value );
-    refresh_token.assign( attr_value );
-    std::cout << "leaving get_refresh_token_for_user" << std::endl;
-    return SUCCESS(); 
 }
 
 
@@ -1336,16 +1448,6 @@ void open_write_to_port(
     std::cout << "entering open_write_to_port with session_id: " << session_id << std::endl;
 
     int ret;
-    /*std::string nonce;
-    ret = generate_nonce( 32, nonce );
-    if ( ret < 0 ) {
-        perror( "error generating nonce" );
-        return;
-    }
-    std::cout << "generated nonce: " << nonce << std::endl;
-    // create copy of nonce for caller, which can be destructed safely
-    nonce_out->assign( nonce );
-*/
     //////////////
     int sockfd, conn_sockfd;
     socklen_t clilen;
@@ -1355,7 +1457,7 @@ void open_write_to_port(
     ret = bind_port( portno, &sockfd );
     if ( ret < 0 ) {
         perror( "error binding to port" );
-        return;
+        throw std::runtime_error( "could not bind to port" );
     }
     std::cout << "bound to port: " << *portno << std::endl;
     /////////////
@@ -1399,109 +1501,25 @@ void open_write_to_port(
         std::cout << "wrote " << msg_len << " bytes for msg: " << msg << std::endl;
 
         // client should now browse to that url sent (msg)
-        std::string subject_id;
-        std::string access_token;
-        std::string expires_in;
-        std::string refresh_token;
-        
-        // TODO handle error return from authorize call
-        irods::error ret = openid_authorize( auth_state, auth_nonce, subject_id, access_token, expires_in, refresh_token );
-        if ( !ret.ok() ) {
-            throw std::runtime_error( "authorization failed" );
-        }
-        std::cout << "returned from authorize" << std::endl;
- 
-        // this access_toekn is too long to store as the password (session token),
-        // so create one for use in irods, which will map as the key to the actual
-        // access_token and any additional information like expiry and per-user refresh_token
-        // TODO TODO TODO TODO SWITCH TO SHA-256, will actually fit within 50 bytes when base64ed (32->42(44)) 
-        // Max irods password is 50bytes, SHA-1 is 20, base64(sha-1) is 27 bytes (28 with pad)
-        char irods_session_token[MAX_PASSWORD_LEN + 1];
-        memset( irods_session_token, 0, MAX_PASSWORD_LEN + 1 );
-        unsigned long base64_sha1_len = (int)( 20 * 4/3 + 1);
-        // include room for pad
-        if ( base64_sha1_len % 4 != 0 ) {
-            base64_sha1_len += 4 - ( base64_sha1_len % 4 );
-        }
-        // include room for null terminator
-        base64_sha1_len += 1;
-
-        char sha1_buf[ 21 ];
-        memset( sha1_buf, 0, 21 );
-        char base64_sha1_buf[ base64_sha1_len ];
-        memset( base64_sha1_buf, 0, base64_sha1_len );
-
-        // access_token is unique per OIDC authentication so use in in sess id
-        obfMakeOneWayHash( // TODO do sha-256 instead
-            HASH_TYPE_SHA1, 
-            (const unsigned char*) access_token.c_str(),
-            access_token.size(),
-            (unsigned char*) sha1_buf );
-        std::cout << "sha1 token: ";
-        for ( int i = 0; i < 20; i++ ) {
-            printf( "%02X", (unsigned char)sha1_buf[i] );
-        }
-        std::cout << std::endl;
-        
-        int encret = base64_encode( 
-            (const unsigned char*) sha1_buf,
-            20,
-            (unsigned char*) base64_sha1_buf,
-            &base64_sha1_len);
-        std::cout << "base64_encode returned: " << encret << std::endl;
-        std::cout << "base64 encoded: ";
-        for ( unsigned long i = 0; i < base64_sha1_len; i++ ) {
-            printf( "%c", base64_sha1_buf[i] );
-        }
-        std::cout << std::endl;
-
-        strncpy( irods_session_token, base64_sha1_buf, base64_sha1_len );
-        std::cout << "created session token: " << irods_session_token << std::endl;
- 
-        // put session token in the server database
-        // user attribute: lib/api/include/modAVUMetadata.h
-        // format: imeta add -u <username> <keyname> <value>
-        
         std::string user_name;
-        ret = get_username_by_subject_id( comm, subject_id, user_name );
+        std::string response_text;
+        // handle error return from authorize call
+        irods::error ret = openid_authorize( auth_state,
+                                             auth_nonce,
+                                             response_text );
         if ( !ret.ok() ) {
-            std::cout << "error retrieving username from subject id" << std::endl;
-            return;
+            throw std::runtime_error( "authorization failed: " + ret.result() );
         }
-
-        std::string metadata_key( OPENID_USER_METADATA_SESSION_PREFIX );
-        metadata_key += irods_session_token;
-
-        // in metadata entry value field, put a kvp string with access_token and expiry
-        irods::kvp_map_t meta_map;
-        meta_map["access_token"] = access_token;
-        // set refresh token if we got one in the auth callback
-        if ( refresh_token.size() > 0 ) {
-            // got a new refresh token, set it in the db
-            set_refresh_token_for_user( comm, user_name, refresh_token );
-            //meta_map["refresh_token"] = refresh_token;
+        
+        if ( openid_provider_name.compare( "globus" ) == 0 ) {
+            ret = handle_access_token_response_globus( comm, response_text, auth_nonce, user_name, session_id );
         }
-        size_t time_buf_len = 50; //magic number, getNowStr limits to 16(15+null)
-        char time_buf[time_buf_len];
-        memset( time_buf, 0, time_buf_len );
-        getNowStr( time_buf );
-        // get expiration time str (now_buf + expires_in)
-        long now_sec = atol( time_buf );
-        long expires_in_sec = std::stol( expires_in, NULL, 10 );
-        long expiry_sec = now_sec + expires_in_sec;
-        memset( time_buf, 0, time_buf_len );
-        snprintf( time_buf, time_buf_len, "%ld", expiry_sec );
-        std::string expiry_str( time_buf );
-        meta_map["expiry"] = expiry_str;
-        meta_map["provider"] = openid_provider_name;
-        meta_map["scope"] = "openid"; // access_token returned from openid_authorize is always openid scope
-        //put into kvp string
-        std::string meta_val = irods::escaped_kvp_string( meta_map );
-
-        ret = add_user_metadata( comm, user_name, metadata_key, meta_val );
+        else {
+            ret = handle_access_token_response( comm, response_text, auth_nonce, user_name, session_id );
+        }
         if ( !ret.ok() ) {
-            std::cout << "error adding user metadata: " << ret.result() << std::endl;
-            return;
+            std::string errmsg = "error handling access token response: " + ret.result();
+            rodsLog( LOG_ERROR, errmsg.c_str() );
         }
 
         // write username, not subject id
@@ -1511,10 +1529,10 @@ void open_write_to_port(
         std::cout << "wrote " << msg_len << " bytes for user_name: " << user_name << std::endl;
 
         // write session token 
-        msg_len = base64_sha1_len; // length of token is always the same
+        msg_len = session_id.size(); // length of token is always the same
         write( conn_sockfd, &msg_len, sizeof( msg_len ) );
-        write( conn_sockfd, irods_session_token, msg_len );
-        std::cout << "wrote " << msg_len << " bytes for irods_session_token: " << irods_session_token << std::endl;
+        write( conn_sockfd, session_id.c_str(), msg_len );
+        std::cout << "wrote " << msg_len << " bytes for irods_session_token: " << session_id << std::endl;
     } // end !authorized
     else {
         std::cout << "starting write for existing session_id" << std::endl;
@@ -1629,28 +1647,51 @@ irods::error openid_auth_agent_request(
                 session_id = "";
                 authorized = false;
             }
-            else if ( genQueryOut->rowCnt > 1 ) {
+            /*else if ( genQueryOut->rowCnt > 1 ) {
                 // multiple metadata entries matched this session id, not good
                 return ERROR( -1, "Improper session state on server." );
-            }
+            }*/
+            // look for the access token with scope=openid
             else {
                 // verify the return from the query
-                char *metadata_value, *irods_user;
+                std::string irods_user;
+                irods::kvp_map_t metadata_map;
+                bool found_openid_scope = false;
+                // find the metadata for this session corresponding to the "openid" scope
+                // only loops multiple times when there are multiple access tokens associated with a single session (like globus)
                 for ( int i = 0; i < genQueryOut->rowCnt; i++ ) {
                     // attributes are: attr_name, attr_value, attr_units, user_name
-                    metadata_value = strdup( genQueryOut->sqlResult[1].value );
-                    irods_user = strdup( genQueryOut->sqlResult[3].value );
+                    char *q_res = genQueryOut->sqlResult[1].value; //get start of result array
+                    q_res += i * genQueryOut->sqlResult[1].len; // shift to row index
+                    std::string metadata_string( q_res );
+
+                    q_res = genQueryOut->sqlResult[3].value;
+                    q_res += i * genQueryOut->sqlResult[3].len;
+                    irods_user = q_res; // assigns by copy
+
+                    irods::parse_escaped_kvp_string( metadata_string, metadata_map );
+                    if ( metadata_map.find( "scope" ) == metadata_map.end() ) {
+                        std::string errmsg = "access_token and session found with no scope attached: " + metadata_string;
+                        rodsLog( LOG_WARNING, errmsg.c_str() );
+                        continue;
+                    }
+                    else {
+                        std::string scope = metadata_map.at( "scope" );
+                        if ( scope.compare( "openid" ) == 0 ) {
+                            found_openid_scope = true;
+                            break;
+                        }
+                    }
+                }
+                if ( !found_openid_scope ) {
+                    std::string errmsg = "Received request for session id which has no openid token metadata: " + session_id;
+                    rodsLog( LOG_ERROR, errmsg.c_str() );
+                    return ERROR( -1, errmsg );
                 }
 
-                std::cout << "metadata_value: " << metadata_value << std::endl;
-                std::cout << "irods_user: " << irods_user << std::endl;
-                
                 // parse metadata value, get access token+expiry
                 // metadata should be formatted as kvp: 
-                //   access_token=<access_token>;expiry=<expiry_timestamp>;
-                irods::kvp_map_t metadata_map;
-                std::string metadata_string( metadata_value );
-                irods::parse_escaped_kvp_string( metadata_string, metadata_map );
+                //   access_token=<access_token>;expiry=<expiry_timestamp>;refresh_token=<refresh_token>;scope=<scope>
                 if ( metadata_map.find( "provider" ) == metadata_map.end()
                      || metadata_map.find( "access_token" ) == metadata_map.end()
                      || metadata_map.find( "expiry" ) == metadata_map.end() ) {
@@ -1660,7 +1701,10 @@ irods::error openid_auth_agent_request(
                 std::string provider = metadata_map["provider"];
                 std::string access_token = metadata_map["access_token"];
                 std::string expiry_str = metadata_map["expiry"];
-
+                std::string refresh_token;
+                if ( metadata_map.find( "refresh_token" ) != metadata_map.end() ) {
+                    refresh_token = metadata_map["refresh_token"];
+                }
                 // if the provider this session was authorized with doesn't match the provider
                 // the client is currently configured to use, require re-authorization
                 if ( provider.compare( openid_provider_name ) != 0 ) {
@@ -1681,15 +1725,12 @@ irods::error openid_auth_agent_request(
                         rodsLog( LOG_NOTICE,
                                  "Access token for session %s is expired, attempting refresh",
                                  session_id.c_str() );
-                        // lookup refresh token for this user
                         std::string user( irods_user );
-                        std::string refresh_token;
-                        ret = get_refresh_token_for_user( _ctx.comm(), user, refresh_token );
 
-                        if ( !ret.ok() || refresh_token.size() <= 0 ) {
+                        if ( refresh_token.size() <= 0 ) {
                             // no refresh token associated with this user in our db
                             rodsLog( LOG_NOTICE,
-                                     "No refresh token associated with this session:\n%s",
+                                     "No refresh token associated with session:\n%s",
                                      ret.result().c_str() );
                             authorized = false;
                         }
@@ -1697,7 +1738,7 @@ irods::error openid_auth_agent_request(
                             ret = refresh_access_token( access_token, expiry_str, refresh_token );
                             if ( !ret.ok() ) {
                                 rodsLog( LOG_WARNING,
-                                         "Could not refresh token for session %s:\n%s",
+                                         "Could not refresh access token for session %s:\n%s",
                                          session_id.c_str(),
                                          ret.result().c_str() );
                                 authorized = false;
@@ -1705,7 +1746,7 @@ irods::error openid_auth_agent_request(
                             else {
                                 // update the session metadata to reflect this new access_token, expiry, and refresh_token
                                 ret = update_session_state_after_refresh( _ctx.comm(), session_id, irods_user,
-                                                                          access_token, expiry_str );
+                                                                          access_token, expiry_str, refresh_token );
                                 if ( !ret.ok() ) {
                                     rodsLog( LOG_ERROR,
                                              "Could not update session state in db after refresh" );
