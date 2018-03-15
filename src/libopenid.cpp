@@ -103,7 +103,7 @@ irods::error get_username_by_subject_id( rsComm_t *comm, std::string subject_id,
 // OPENID helper methods
 bool curl_post( std::string url, std::string *fields, std::vector<std::string> *headers, std::string *response );
 std::string *curl_get( std::string url, std::string *fields );
-
+static bool openidDebug = false;
 ///END DECLARATIONS
 
 #define OPENID_COMM_PORT 1357
@@ -114,6 +114,88 @@ std::string *curl_get( std::string url, std::string *fields );
 #define OPENID_USER_METADATA_SESSION_PREFIX "openid_sess_"
 #define OPENID_USER_METADATA_REFRESH_TOKEN_KEY "openid_refresh_token"
 
+#define AUTH_FILENAME_DEFAULT ".irods/.irodsA" //under HOME
+
+/*
+    Only systems with HOME defined
+*/
+std::string sess_filename()
+{
+    char path[LONG_NAME_LEN + 1];
+    memset( path, 0, LONG_NAME_LEN + 1 );
+    char *env = getRodsEnvAuthFileName();
+    if ( env != NULL && *env != '\0' ) {
+        return std::string( env );
+    }
+
+    env = getenv( "HOME" );
+    printf( "HOME: %s\n", env );
+    if ( env == NULL ) {
+        throw std::runtime_error( "environment variable HOME not defined: "
+                + std::to_string( ENVIRONMENT_VAR_HOME_NOT_DEFINED ) );
+    }
+    strncpy( path, env, strlen( env ) );
+    strncat( path, "/", MAX_NAME_LEN - strlen( path ) );
+    strncat( path, AUTH_FILENAME_DEFAULT, MAX_NAME_LEN - strlen( path ) );
+    return std::string( path );
+}
+int write_sess_file( std::string val )
+{
+    puts( "entering write_sess_file" );
+    FILE *fd = fopen( sess_filename().c_str(), "w+" );
+    if ( !fd ) {
+        perror( "could not open session file for writing" );
+        return -1;
+    }
+    size_t n_char = fwrite( val.c_str(), sizeof( char ), val.size(), fd );
+    if ( n_char != val.size() ) {
+        printf( "Could not write value to session. Length was %lu but only wrote %lu\n", val.size(), n_char );
+        return -2;
+    }
+    puts( "leaving write_sess_file" );
+    return 0;
+}
+int read_sess_file( std::string& val_out )
+{
+    puts( "entering read_sess_file" );
+    FILE *fd = fopen( sess_filename().c_str(), "r" );
+    if ( !fd ) {
+        perror( "could not open session file for reading" );
+        return -1;
+    }
+    size_t total_bytes = 0;
+    while ( true ) {
+        char buf[256];
+        memset( buf, 0, 256 );
+        size_t n_char = fread( buf, sizeof( char ), 255, fd );
+        if ( n_char > 0 ) {
+            total_bytes += n_char;
+            val_out.append( buf );
+        }
+        if ( n_char < 255 ) {
+            break;
+        }
+    }
+    if ( feof( fd ) ) {
+        printf( "leaving read_sess_file: %s\n", val_out.c_str() );
+        return 0;
+    }
+    else if ( ferror( fd ) ) {
+        printf( "error during file read\n" );
+        return -2;
+    }
+    else {
+        printf( "unknown error occurred reading session file\n" );
+        return -3;
+    }
+}
+
+void debug( std::string msg )
+{
+    if ( openidDebug ) {
+        puts( msg.c_str() );
+    }
+}
 
 /*
     Reads bytes from a socket and puts them in msg_out.
@@ -177,7 +259,7 @@ int read_msg( int sockfd, std::string& msg_out )
 */
 void read_from_server( int portno, std::string nonce, std::string& user_name, std::string& session_token )
 {
-    std::cout << "entering read_from_server" << std::endl;
+    debug( "entering read_from_server" );
     int sockfd;
     struct sockaddr_in serv_addr;
     struct hostent* server;
@@ -232,7 +314,7 @@ void read_from_server( int portno, std::string nonce, std::string& user_name, st
         perror( "error reading username from server" );
         return;
     }
-    std::cout << "read user_name: " << user_name << std::endl;
+    debug( "read user_name: " + user_name );
 
     // wait for session token now
     int len = read_msg( sockfd, session_token );
@@ -240,17 +322,17 @@ void read_from_server( int portno, std::string nonce, std::string& user_name, st
         perror( "error reading session token from server" );
         return;
     }
-    std::cout << "read session token: " << session_token << std::endl;
-    std::cout << "session token length: " << len << std::endl;
+    debug( "read session token: " + session_token );
+    debug( "session token length: " + std::to_string( len ) );
 
     close( sockfd );
-    std::cout << "leaving read_from_server" << std::endl;
+    debug( "leaving read_from_server" );
 }
 
 
 irods::error openid_auth_establish_context(
     irods::plugin_context& _ctx ) {
-    //std::cout << "entering openid_auth_establish_context" << std::endl;
+    //debug( "entering openid_auth_establish_context" );
     irods::error result = SUCCESS();
     irods::error ret;
 
@@ -260,7 +342,7 @@ irods::error openid_auth_establish_context(
     }
     irods::generic_auth_object_ptr ptr = boost::dynamic_pointer_cast<irods::generic_auth_object>( _ctx.fco() );
 
-    //std::cout << "leaving openid_auth_establish_context" << std::endl;
+    //debug( "leaving openid_auth_establish_context" );
     return ret;
 }
 
@@ -269,7 +351,7 @@ irods::error openid_auth_client_start(
     rcComm_t*              _comm,
     const char*            _context_string)
 {
-    std::cout << "entering openid_auth_client_start" << std::endl;
+    debug( "entering openid_auth_client_start" );
     irods::error result = SUCCESS();
     irods::error ret;
 
@@ -291,28 +373,33 @@ irods::error openid_auth_client_start(
             irods::kvp_map_t ctx_map;
             std::string client_provider_cfg = irods::get_environment_property<std::string&>("openid_provider");
             ctx_map["provider"] = client_provider_cfg;
+            debug( "client using provider: " + ctx_map["provider"] );
 
             // set existing session id from pw file if exists
-            char pwBuf[MAX_PASSWORD_LEN + 1];
-            memset( pwBuf, 0, MAX_PASSWORD_LEN + 1);
-            int getPwError = obfGetPw( pwBuf );
-            if ( getPwError || strlen( (const char*)pwBuf ) == 0 ) {
-                std::cout << "No cached password file" << std::endl;
-                std::cout << "obfGetPw returned: " << getPwError << std::endl;
+            std::string sess_id;
+            int sess_ret = read_sess_file( sess_id );
+
+            if ( sess_ret < 0 || sess_id.size() == 0 ) {
+                std::cout << "No cached session file" << std::endl;
+                debug( "obfGetPw returned: " + std::to_string( sess_ret ) );
             }
             else {
-                std::cout << "Password file contains: " << pwBuf << std::endl;
+                debug( "password file contains: " + std::string( sess_id ) );
                 // set the password in the context string
-                ctx_map[irods::AUTH_PASSWORD_KEY] = pwBuf;
+                ctx_map[irods::AUTH_PASSWORD_KEY] = sess_id;
             }
+            debug( "client startup context" );
+            for ( auto iter = ctx_map.begin(); iter != ctx_map.end(); ++iter ) {
+                debug( "key: " + iter->first + ", value: " + iter->second );
+            }
+            debug( "" );
 
             std::string new_context_str = irods::escaped_kvp_string( ctx_map );
-            std::cout << "setting context: " << new_context_str << std::endl;
+            debug( "setting context: " + new_context_str );
             ptr->context( new_context_str );
-
         }
     }
-    std::cout << "leaving openid_auth_client_start" << std::endl;
+    debug( "leaving openid_auth_client_start" );
     return result;
 }
 
@@ -407,7 +494,7 @@ irods::error decode_id_token(
 irods::error openid_auth_client_request(
     irods::plugin_context& _ctx,
     rcComm_t*              _comm ) {
-    std::cout << "entering openid_auth_client_request" << std::endl;
+    debug( "entering openid_auth_client_request" );
     irods::error ret;
 
     // validate incoming parameters
@@ -445,22 +532,20 @@ irods::error openid_auth_client_request(
 
     // call plugin request to server in thread
     authPluginReqOut_t *req_out = 0;
-    std::cout << "calling rcAuthPluginRequest" << std::endl;
+    debug( "calling rcAuthPluginRequest" );
     int status = rcAuthPluginRequest( _comm, &req_in, &req_out );
 
     irods::kvp_map_t out_map;
     irods::parse_escaped_kvp_string( req_out->result_, out_map );
-    printf( "received result from rcAuthPluginRequest: port: %s, nonce: %s\n", out_map["port"].c_str(), out_map["nonce"].c_str() );
+    printf( "received comm info from server: port: %s, nonce: %s\n", out_map["port"].c_str(), out_map["nonce"].c_str() );
     int portno = std::stoi( out_map["port"] );
     std::string nonce = out_map["nonce"]; //
-    std::cout << "received port from server: " << portno << std::endl;
-    std::cout << "received nonce from server: " << nonce << std::endl;
 
     // perform authorization handshake with server
     // server performs authorization, waits for client to authorize via url it returns via socket
     // when client authorizes, server requests a token from OIDC provider and returns email+session token
     std::string user_name, session_token;
-    std::cout << "attempting to read username and session token from server" << std::endl;
+    debug( "attempting to read username and session token from server" );
     read_from_server( portno, nonce, user_name, session_token );
     ptr->user_name( user_name );
 
@@ -477,14 +562,29 @@ irods::error openid_auth_client_request(
             return ERROR( -1, "unable to parse context string after rcAuthPluginRequest" );
         }
         std::string original_sess = context_map[ irods::AUTH_PASSWORD_KEY ];
+        if ( session_token.size() > NAME_LEN ) {
+            throw std::runtime_error( "Session was too long: " + std::to_string( session_token.size() ) );
+        }
+
+        // copy it to the authStr field NAME_LEN=64
+        strncpy( _comm->clientUser.authInfo.authStr, session_token.c_str(), session_token.size() );
+
+
         if ( session_token.size() != 0 && session_token.compare( original_sess ) != 0 ) {
             // server returned a new session token, because existing one is not valid
-            std::cout << "writing session_token to .irodsA" << std::endl;
-            int obfret = obfSavePw( 0, 0, 1, session_token.c_str() );
-            std::cout << "got " << obfret << " from obfSavePw" << std::endl;
+            //std::cout << "writing session_token to .irodsA" << std::endl;
+            //int obfret = obfSavePw( 0, 0, 1, session_token.c_str() );
+            // Not using obfSavePw, saving the raw hash to irodsA.
+            //char fileName[MAX_PASSWORD_LEN + 10];
+            //int obfret;
+            //obfret = obfiGetFileName( fileName );
+            //int fd = obfiOpenOutFile( fileName, 0 );
+            //obfret = obfiWritePw( fd, session_token.c_str() ); 
+            int a = write_sess_file( session_token );
+            debug( "got " + std::to_string( a ) + " from write_sess_file" );
         }
         free( req_out );
-        std::cout << "leaving openid_auth_client_request" << std::endl;
+        debug( "leaving openid_auth_client_request" );
         return SUCCESS();
     }
 }
@@ -493,7 +593,7 @@ irods::error openid_auth_client_request(
 irods::error openid_auth_client_response(
     irods::plugin_context& _ctx,
     rcComm_t*              _comm ) {
-    //std::cout << "entering openid_auth_client_response" << std::endl;
+    debug( "entering openid_auth_client_response" );
     irods::error result = SUCCESS();
     irods::error ret;
 
@@ -521,7 +621,7 @@ irods::error openid_auth_client_response(
             char username[ MAX_NAME_LEN ];
             strncpy( username, user_name.c_str(), MAX_NAME_LEN );
             // TODO if no username present, don't even bother calling rcAuthResponse because it will fail for sure
-            std::cout << "using user_name: " << user_name << std::endl;
+            std::cout << "user_name: " << user_name << std::endl;
             authResponseInp_t auth_response;
             auth_response.response = response;
             auth_response.username = username;
@@ -529,7 +629,7 @@ irods::error openid_auth_client_response(
             result = ASSERT_ERROR( status >= 0, status, "Call to rcAuthResponse failed." );
         }
     }
-    //std::cout << "leaving openid_auth_client_response" << std::endl;
+    debug( "leaving openid_auth_client_response" );
     return result;
 }
 
