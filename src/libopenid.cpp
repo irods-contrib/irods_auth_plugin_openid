@@ -1887,11 +1887,12 @@ irods::error token_service_get_by_nonce(
         std::string provider,
         std::string scope,
         std::string nonce,
+        int block,
         long *status_code,
         json_t **resp_root )
 {
     std::cout << "entering token_service_get_by_nonce" << std::endl;
-    return _token_service_get( "", provider, scope, nonce, 60, status_code, resp_root );
+    return _token_service_get( "", provider, scope, nonce, block, status_code, resp_root );
 }
 
 irods::error token_service_get_by_subject(
@@ -2203,10 +2204,20 @@ void open_write_to_port(
                     session_id.c_str() );
         }
     }
-    
+    /*
     if ( !authorized && status_code == 200 ) {
         // no session in irods, but has already logged into the service
-        msg = "SUCCESS";
+        //msg = "SUCCESS";
+        ret = token_service_get_url( openid_provider_name, "openid", &status_code, &resp_root );
+
+        if ( json_is_string( json_object_get( resp_root, "authorization_url" ) ) ) {
+            msg = json_string_value( json_object_get( resp_root, "authorization_url" ) );
+        }
+        else {
+            // TODO cleanup?
+            rodsLog( LOG_ERROR, "could not parse response from token service" );
+            return;
+        }
     }
 
     if ( !authorized && status_code == 401 ) {
@@ -2223,10 +2234,22 @@ void open_write_to_port(
             rodsLog( LOG_ERROR, "could not parse response from token service" );
             return;
         } 
-    }
+    }*/
 
     if ( !authorized || status_code == 401 ) {
         std::cout << "not authorized, user must re-authenticate" << std::endl;
+
+        // user either wasn't provided, wasn't valid, or the session was deactivated/invalid
+        // user must re-authenticate
+        ret = token_service_get_url( openid_provider_name, "openid", &status_code, &resp_root );
+        if ( json_is_string( json_object_get( resp_root, "authorization_url" ) ) ) {
+            msg = json_string_value( json_object_get( resp_root, "authorization_url" ) );
+        }
+        else {
+            // TODO cleanup?
+            rodsLog( LOG_ERROR, "could not parse response from token service" );
+            return;
+        } 
 
         // send back [url] send blocking to token service
         // if 200 send back [username, session id]
@@ -2238,8 +2261,10 @@ void open_write_to_port(
         // block against token service for 60 seconds
         json_t *block_resp_root;
         long block_status_code;
-        ret = token_service_get_by_subject( subject_id, openid_provider_name, "openid", 60, &block_status_code, &block_resp_root );
-        //ret = token_service_get_by_nonce( openid_provider_name, "openid", nonce, &block_status_code, &block_resp_root );
+        std::string nonce;
+        ret = parse_nonce_from_authorization_url( msg, nonce );
+        //ret = token_service_get_by_subject( subject_id, openid_provider_name, "openid", 60, &block_status_code, &block_resp_root );
+        ret = token_service_get_by_nonce( openid_provider_name, "openid", nonce, 60, &block_status_code, &block_resp_root );
         if ( !ret.ok() ) {
             json_decref( resp_root );
             rodsLog( LOG_ERROR, ret.result().c_str() );
