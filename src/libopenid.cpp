@@ -1283,7 +1283,7 @@ irods::error get_subject_id_by_user_name( rsComm_t *comm, std::string user_name,
 irods::error get_subject_id_by_session_id( rsComm_t *comm, std::string session_id, std::string& subject_id)
 {
     irods::error ret;
-    rodsLog( LOG_NOTICE, "entering get_subject_id_by_session_id with: %s", subject_id.c_str() );
+    rodsLog( LOG_NOTICE, "entering get_subject_id_by_session_id with: %s", session_id.c_str() );
     int status;
     genQueryInp_t genQueryInp;
     genQueryOut_t *genQueryOut;
@@ -2160,7 +2160,7 @@ void open_write_to_port(
         // send back [SUCCESS, username, session id]
 
         // send back username
-        std::string session_user;
+        /*std::string session_user;
         ret = get_username_by_session_id( comm, session_id, &session_user );
         if ( !ret.ok() ) {
             std::cout << "no user for session" << std::endl;
@@ -2180,7 +2180,7 @@ void open_write_to_port(
             delete write_thread;
             return;
         }
-        else {
+        else {*/
             authorized = true;
             rodsLog( LOG_NOTICE, "session is valid" );
             // send back SUCCESS
@@ -2202,7 +2202,7 @@ void open_write_to_port(
                     OPENID_SESSION_VALID.c_str(),
                     user_name.c_str(),
                     session_id.c_str() );
-        }
+        //}
     }
     /*
     if ( !authorized && status_code == 200 ) {
