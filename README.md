@@ -3,7 +3,7 @@
 ## Summary
 This irods auth plugin allows a user to log into iRODS using credentials from an existing OpenID identity.
 
-## Pre-requisites:
+## Prerequisites:
 
 1. A token management service must be installed.  This service handles the mapping of OpenID identity provider short names (like globus, google, yahoo, cilogon) to the actual API endpoints for those providers, as well as receiving the HTTP callbacks upon user login, exchanging the authorization code for tokens, parsing token responses, safely storing the tokens, and refreshing them when they expire.  The service acts as an abstraction layer on top of all of those operations, for client applications (like this auth plugin) which only want to have a user log in at a provider, and receive the token back when they do.  See the information here (https://github.com/heliumdatacommons/auth_microservice) on how to set it up.
 2. The token service is served at a domain accessible by the users who will be logging into iRODS.  If all logins will be done in a private network, then it is okay to serve it at a private host.  The service must also have TLS enabled.  This can be done by binding the service to 127.0.0.1 and then putting an NGINX instance with an SSL cert in front of it as a reverse proxy.
