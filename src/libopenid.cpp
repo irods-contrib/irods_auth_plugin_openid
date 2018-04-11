@@ -1852,6 +1852,12 @@ irods::error _token_service_get(
         rodsLog( LOG_NOTICE, "request to token_service succeeded" );
     }
     
+    if ( *status_code != 200 && *status_code != 401 ) {
+        std::ostringstream err_msg;
+        err_msg << "token service returned " << *status_code << std::endl << curl_resp << std::endl;
+        rodsLog( LOG_ERROR, err_msg.str().c_str() );
+        return ERROR( -1, err_msg.str() );
+    }
     json_error_t json_err;
     *resp_root = json_loads( curl_resp.c_str(), 0, &json_err );
     if ( *resp_root == NULL ) {
@@ -1863,8 +1869,6 @@ irods::error _token_service_get(
         std::cout << *status_code;
         std::cout << std::endl << "response: ";
         std::cout << curl_resp;
-        //msg << std::endl << "status_code: " << *status_code;
-        //msg << ", response: " << curl_resp;
         rodsLog( LOG_ERROR, msg.str().c_str() );
         return ERROR( -1, msg.str() );
     }
