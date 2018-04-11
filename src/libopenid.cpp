@@ -2161,86 +2161,34 @@ void open_write_to_port(
         std::cout << std::endl;
         _hex_from_binary( access_token_sha256, 32, session_id );
 
-        // send back [SUCCESS, username, session id]
+        authorized = true;
+        rodsLog( LOG_NOTICE, "session is valid" );
+        // send back SUCCESS
+        msg = OPENID_SESSION_VALID;
+        msg_len = msg.size();
+        write( conn_sockfd, &msg_len, sizeof( msg_len ) );
+        write( conn_sockfd, msg.c_str(), msg_len );
 
-        // send back username
-        /*std::string session_user;
-        ret = get_username_by_session_id( comm, session_id, &session_user );
-        if ( !ret.ok() ) {
-            std::cout << "no user for session" << std::endl;
-            authorized = false;
-            session_id = "";
-        }
-        else if ( session_user.compare( user_name ) != 0 ) {
-            std::cout << "user mismatch" << std::endl;
-            // check if this session matches the session that the client is authenticating with
-            authorized = false;
-            msg = "could not authenticate this user with the provided session";
-            msg_len = msg.size();
-            write( conn_sockfd, &msg_len, sizeof( msg_len ) );
-            write( conn_sockfd, msg.c_str(), msg_len );
-            close( conn_sockfd );
-            close( sockfd );
-            delete write_thread;
-            return;
-        }
-        else {*/
-            authorized = true;
-            rodsLog( LOG_NOTICE, "session is valid" );
-            // send back SUCCESS
-            msg = OPENID_SESSION_VALID;
-            msg_len = msg.size();
-            write( conn_sockfd, &msg_len, sizeof( msg_len ) );
-            write( conn_sockfd, msg.c_str(), msg_len );
+        msg_len = user_name.size();
+        write( conn_sockfd, &msg_len, sizeof( msg_len ) );
+        write( conn_sockfd, user_name.c_str(), msg_len );
 
-            msg_len = user_name.size();
-            write( conn_sockfd, &msg_len, sizeof( msg_len ) );
-            write( conn_sockfd, user_name.c_str(), msg_len );
+        // send back session_id
+        msg_len = session_id.size();
+        write( conn_sockfd, &msg_len, sizeof( msg_len ) );
+        write( conn_sockfd, session_id.c_str(), msg_len );
 
-            // send back session_id
-            msg_len = session_id.size();
-            write( conn_sockfd, &msg_len, sizeof( msg_len ) );
-            write( conn_sockfd, session_id.c_str(), msg_len );
-
-            rodsLog( LOG_NOTICE, "wrote (msg,user,sess) to client: (%s,%s,%s)",
-                    OPENID_SESSION_VALID.c_str(),
-                    user_name.c_str(),
-                    session_id.c_str() );
-        //}
-    }
-    /*
-    if ( !authorized && status_code == 200 ) {
-        // no session in irods, but has already logged into the service
-        //msg = "SUCCESS";
-        ret = token_service_get_url( openid_provider_name, "openid", &status_code, &resp_root );
-
-        if ( json_is_string( json_object_get( resp_root, "authorization_url" ) ) ) {
-            msg = json_string_value( json_object_get( resp_root, "authorization_url" ) );
-        }
-        else {
-            // TODO cleanup?
-            rodsLog( LOG_ERROR, "could not parse response from token service" );
-            return;
-        }
-    }
-
-    if ( !authorized && status_code == 401 ) {
-        // send request for a url by sending an empty uid param
-        ret = token_service_get_url( openid_provider_name, "openid", &status_code, &resp_root );
-
-        // user either wasn't provided, wasn't valid, or the session was deactivated/invalid
-        // user must re-authenticate
-        if ( json_is_string( json_object_get( resp_root, "authorization_url" ) ) ) {
-            msg = json_string_value( json_object_get( resp_root, "authorization_url" ) );
-        }
-        else {
-            // TODO cleanup?
-            rodsLog( LOG_ERROR, "could not parse response from token service" );
-            return;
-        } 
-    }*/
-
-    if ( !authorized || status_code == 401 ) {
+        rodsLog( LOG_NOTICE, "wrote (msg,user,sess) to client: (%s,%s,%s)",
+                OPENID_SESSION_VALID.c_str(),
+                user_name.c_str(),
+                session_id.c_str() );
+        //close( conn_sockfd );
+        //close( sockfd );
+        //delete write_thread;
+        //write_thread = NULL;
+        //return;
+    } 
+    else if ( !authorized || status_code == 401 ) {
         std::cout << "not authorized, user must re-authenticate" << std::endl;
 
         // user either wasn't provided, wasn't valid, or the session was deactivated/invalid
@@ -2324,7 +2272,7 @@ void open_write_to_port(
         }
         else {
             rodsLog( LOG_ERROR, "token service returned status [%ld] on blocking token request", block_status_code );
-            // failed to log in TODO
+            // token service did not detect a login callback TODO
         }
     }
     else {
