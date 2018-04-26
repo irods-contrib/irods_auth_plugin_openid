@@ -907,7 +907,53 @@ irods::error get_subject_id_by_user_name( rsComm_t *comm, std::string user_name,
     return SUCCESS();
 }
 
-irods::error get_subject_id_by_session_id( rsComm_t *comm, std::string session_id, std::string& subject_id)
+
+irods::error get_session_id_by_user_name( rsComm_t *comm, std::string user_name, std::string& session_id ) 
+{
+    irods::error ret;
+    rodsLog( LOG_NOTICE, "entering get_session_id_by_user_name: %s", user_name.c_str() );
+    int status;
+    genQueryInp_t genQueryInp;
+    genQueryOut_t *genQueryOut;
+    memset( &genQueryInp, 0, sizeof ( genQueryInp_t ) );
+
+    // select
+    addInxIval( &genQueryInp.selectInp, COL_META_USER_ATTR_NAME, 1 );
+    addInxIval( &genQueryInp.selectInp, COL_META_USER_ATTR_VALUE, 1 );
+    addInxIval( &genQueryInp.selectInp, COL_USER_DN, 1 );
+    
+    // where attr name matches
+    std::string w1;
+    w1 = "='";
+    w1 += OPENID_USER_METADATA_SESSION_PREFIX;
+    w1 += "'";
+    addInxVal( &genQueryInp.sqlCondInp, COL_META_USER_ATTR_NAME, w1.c_str() );
+
+    genQueryInp.maxRows = 2;
+    status = rsGenQuery( comm, &genQueryInp, &genQueryOut );
+    if ( status == CAT_NO_ROWS_FOUND || status < 0 ) {
+        std::ostringstream err_stream;
+        err_stream << "No results from rsGenQuery: " << status;
+        std::cout << err_stream.str() << std::endl;
+        freeGenQueryOut( &genQueryOut );
+        return ERROR( status, err_stream.str() );
+    }
+    char *value = genQueryOut->sqlResult[1].value;
+    irods::kvp_map_t meta_map;
+    ret = irods::parse_escaped_kvp_string( std::string( value ), meta_map );
+    if ( !ret.ok() ) {
+        freeGenQueryOut( &genQueryOut );
+        return ret;
+    }
+    session_id = meta_map["session_id"];
+
+    freeGenQueryOut( &genQueryOut );
+    rodsLog( LOG_NOTICE, "leaving get_session_id_by_user_name with session_id: %s", session_id.c_str() );
+    return SUCCESS();
+}
+
+
+irods::error get_subject_id_by_session_id( rsComm_t *comm, std::string session_id, std::string& subject_id )
 {
     irods::error ret;
     rodsLog( LOG_NOTICE, "entering get_subject_id_by_session_id with: %s", session_id.c_str() );
@@ -951,6 +997,7 @@ irods::error get_subject_id_by_session_id( rsComm_t *comm, std::string session_i
     irods::kvp_map_t meta_map;
     ret = irods::parse_escaped_kvp_string( std::string( value ), meta_map );
     if ( !ret.ok() ) {
+        freeGenQueryOut( &genQueryOut );
         return ret;
     }
     subject_id = meta_map["subject_id"];
@@ -1718,14 +1765,17 @@ void open_write_to_port(
     long status_code;
     const int DONT_BLOCK = -1;
     std::string subject_id;
-    
+
     // check if the session is valid in irods icat, ignore subject_id here
+    // if not, reauthenticate from scratch and create new metadata entry
     ret = get_subject_id_by_session_id( comm, session_id, subject_id );
     if ( !ret.ok() ) {
         std::cout << "no subject id found for this session" << std::endl;
         // no matching subject, query for token with empty uid param
         subject_id = "";
         authorized = false;
+
+        // TODO Look up an existing session id from the openid_sess_ key on the user
     }
     else {
         authorized = true;
@@ -1770,7 +1820,10 @@ void open_write_to_port(
         debug( "token service returned 200" );
         // this user has an icat session and still has an active session in the token microservice (not revoked or expired)
         authorized = true;
+        
         // send back new session_id in case the token has been updated
+        // use existing session, not based on new token
+        /*
         std::string current_access_token;
         if ( json_is_string( json_object_get( resp_root, "access_token" ) ) ) {
             current_access_token = json_string_value( json_object_get( resp_root, "access_token" ) );
@@ -1788,9 +1841,11 @@ void open_write_to_port(
             printf( "%02X", (unsigned char)access_token_sha256[i] );
         }
         std::cout << std::endl;
+        // TODO remove this comment
         //_hex_from_binary( access_token_sha256, 32, session_id );
+        */
+        
 
-        authorized = true;
         rodsLog( LOG_NOTICE, "session is valid" );
         // send back SUCCESS
         msg = OPENID_SESSION_VALID;
@@ -1811,11 +1866,6 @@ void open_write_to_port(
                 OPENID_SESSION_VALID.c_str(),
                 user_name.c_str(),
                 session_id.c_str() );
-        //close( conn_sockfd );
-        //close( sockfd );
-        //delete write_thread;
-        //write_thread = NULL;
-        //return;
     } 
     else if ( !authorized || status_code == 401 ) {
         std::cout << "not authorized, user must re-authenticate" << std::endl;
@@ -1850,13 +1900,6 @@ void open_write_to_port(
         for ( size_t i = 0; i < count; i++ ) {
             std::cout << "polling token service for nonce, count : " << i << std::endl;
             ret = token_service_get_by_nonce( openid_provider_name, "openid", nonce, DONT_BLOCK, &poll_status_code, &poll_resp_root );
-            //if ( !ret.ok() ) {
-            //    if ( !poll_resp_root ) {
-            //        json_decref( poll_resp_root );
-            //    }
-            //    rodsLog( LOG_ERROR, ret.result().c_str() );
-            //    break;
-            //}
             rodsLog( LOG_NOTICE, ret.result().c_str() );
             if ( poll_status_code < 400 ) {
                 break;
@@ -1868,7 +1911,7 @@ void open_write_to_port(
         
         //ret = token_service_get_by_nonce( openid_provider_name, "openid", nonce, 60, &block_status_code, &block_resp_root );
         if ( !ret.ok() ) {
-            json_decref( resp_root );
+            //json_decref( resp_root );
             rodsLog( LOG_ERROR, ret.result().c_str() );
         }
         
@@ -1876,28 +1919,35 @@ void open_write_to_port(
             // user logged in within 60 second limit
             json_t *token_obj = json_object_get( poll_resp_root, "access_token" );
             if ( json_is_string( token_obj ) ) {
-                std::string access_token = json_string_value( token_obj );
-                char access_token_sha256[ 33 ];
-                _sha256_hash( access_token, access_token_sha256 );
-                std::cout << "sha256 token: ";
-                for ( int i = 0; i < 32; i++ ) {
-                    printf( "%02X", (unsigned char)access_token_sha256[i] );
+
+                // see if session id already exists for this user
+                std::string existing_session_id;
+                ret = get_session_id_by_user_name( comm, user_name, existing_session_id );
+                if ( !ret.ok() || existing_session_id.size() == 0 ) {
+                    // no session id exists for this user
+                    std::string access_token = json_string_value( token_obj );
+                    char access_token_sha256[ 33 ];
+                    _sha256_hash( access_token, access_token_sha256 );
+                    std::cout << "sha256 token: ";
+                    for ( int i = 0; i < 32; i++ ) {
+                        printf( "%02X", (unsigned char)access_token_sha256[i] );
+                    }
+                    std::cout << std::endl;
+                    _hex_from_binary( access_token_sha256, 32, session_id );
+
+                    // write this new session to the database 
+                    std::string metadata_key = OPENID_USER_METADATA_SESSION_PREFIX;
+                    std::string meta_val = "subject_id=";
+                    meta_val += subject_id;
+                    meta_val += ";session_id=";
+                    meta_val += session_id;
+                    ret = add_user_metadata( comm, user_name, metadata_key, meta_val );
+                    // TODO handle return
                 }
-                std::cout << std::endl;
-                _hex_from_binary( access_token_sha256, 32, session_id );
-
-                json_decref( poll_resp_root );
-
-                // write this new session to the database 
-                // TODO reuse existing session_id if exists
-                std::string metadata_key = OPENID_USER_METADATA_SESSION_PREFIX;
-                std::string meta_val = "subject_id=";
-                meta_val += subject_id;
-                meta_val += ";session_id=";
-                meta_val += session_id;
-                ret = add_user_metadata( comm, user_name, metadata_key, meta_val );
-                // TODO handle return
-
+                else {
+                    // already has session id
+                    session_id = existing_session_id;
+                }
                 // send back the user name
                 msg_len = user_name.size();
                 write( conn_sockfd, &msg_len, sizeof( msg_len ) );
@@ -1917,6 +1967,7 @@ void open_write_to_port(
                 rodsLog( LOG_ERROR, "could not parse response from token service on polling for valid token" );
                 // TODO cleanly cut connection with client
             }
+            json_decref( poll_resp_root );
         }
         else {
             rodsLog( LOG_ERROR, "token service returned status [%ld] on polling for token", poll_status_code );
