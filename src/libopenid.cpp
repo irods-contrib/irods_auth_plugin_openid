@@ -1,6 +1,6 @@
 //#define USE_SSL 1 (libpam.cpp)
 #include "sslSockComm.h"
-
+#include "getRodsEnv.h"
 #include "authCheck.h"
 #include "authPluginRequest.h"
 #include "authRequest.h"
@@ -97,7 +97,7 @@ bool curl_get( std::string url, std::string *params, std::vector<std::string> *h
 ///END DECLARATIONS
 
 // increases output
-static bool openidDebug = false;
+static bool openidDebug = true;
 
 #define OPENID_COMM_PORT 1357
 #define OPENID_ACCESS_TOKEN_KEY "access_token"
@@ -201,6 +201,192 @@ std::string json_err_message( json_error_t err )
     return stream.str();
 }
 
+
+static void
+sslLogError( const char *msg ) {
+    unsigned long err;
+    char buf[512];
+
+    while ( ( err = ERR_get_error() ) ) {
+        ERR_error_string_n( err, buf, 512 );
+        rodsLog( LOG_ERROR, "%s. SSL error: %s", msg, buf );
+    }
+}
+
+
+static int
+sslVerifyCallback( int ok, X509_STORE_CTX *store ) {
+    char data[256];
+
+    /* log any verification problems, even if we'll still accept the cert */
+    if ( !ok ) {
+        auto *cert = X509_STORE_CTX_get_current_cert( store );
+        int  depth = X509_STORE_CTX_get_error_depth( store );
+        int  err = X509_STORE_CTX_get_error( store );
+
+        rodsLog( LOG_NOTICE, "sslVerifyCallback: problem with certificate at depth: %i", depth );
+        X509_NAME_oneline( X509_get_issuer_name( cert ), data, 256 );
+        rodsLog( LOG_NOTICE, "sslVerifyCallback:   issuer = %s", data );
+        X509_NAME_oneline( X509_get_subject_name( cert ), data, 256 );
+        rodsLog( LOG_NOTICE, "sslVerifyCallback:   subject = %s", data );
+        rodsLog( LOG_NOTICE, "sslVerifyCallback:   err %i:%s", err,
+                 X509_verify_cert_error_string( err ) );
+    }
+
+    return ok;
+}
+
+
+static SSL_CTX*
+sslInit( char *certfile, char *keyfile ) {
+    static int init_done = 0;
+
+    rodsEnv env;
+    int status = getRodsEnv( &env );
+    if ( status < 0 ) {
+        rodsLog(
+            LOG_ERROR,
+            "sslInit - failed in getRodsEnv : %d",
+            status );
+        return NULL;
+
+    }
+
+    if ( !init_done ) {
+        SSL_library_init();
+        SSL_load_error_strings();
+        init_done = 1;
+    }
+
+    /* in our test programs we set up a null signal
+       handler for SIGPIPE */
+    /* signal(SIGPIPE, sslSigpipeHandler); */
+
+    SSL_CTX* ctx = SSL_CTX_new( SSLv23_method() );
+
+    SSL_CTX_set_options( ctx, SSL_OP_ALL | SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 | SSL_OP_SINGLE_DH_USE );
+
+    /* load our keys and certificates if provided */
+    if ( certfile ) {
+        if ( SSL_CTX_use_certificate_chain_file( ctx, certfile ) != 1 ) {
+            sslLogError( "sslInit: couldn't read certificate chain file" );
+            SSL_CTX_free( ctx );
+            return NULL;
+        }
+        else {
+            if ( SSL_CTX_use_PrivateKey_file( ctx, keyfile, SSL_FILETYPE_PEM ) != 1 ) {
+                sslLogError( "sslInit: couldn't read key file" );
+                SSL_CTX_free( ctx );
+                return NULL;
+            }
+        }
+    }
+
+    /* set up CA paths and files here */
+    const char *ca_path = strcmp( env.irodsSSLCACertificatePath, "" ) ? env.irodsSSLCACertificatePath : NULL;
+    const char *ca_file = strcmp( env.irodsSSLCACertificateFile, "" ) ? env.irodsSSLCACertificateFile : NULL;
+    if ( ca_path || ca_file ) {
+        if ( SSL_CTX_load_verify_locations( ctx, ca_file, ca_path ) != 1 ) {
+            sslLogError( "sslInit: error loading CA certificate locations" );
+        }
+    }
+    if ( SSL_CTX_set_default_verify_paths( ctx ) != 1 ) {
+        sslLogError( "sslInit: error loading default CA certificate locations" );
+    }
+
+    /* Set up the default certificate verification */
+    /* if "none" is specified, we won't stop the SSL handshake
+       due to certificate error, but will log messages from
+       the verification callback */
+    const char* verify_server = env.irodsSSLVerifyServer;
+    if ( verify_server && !strcmp( verify_server, "none" ) ) {
+        SSL_CTX_set_verify( ctx, SSL_VERIFY_NONE, sslVerifyCallback );
+    }
+    else {
+        SSL_CTX_set_verify( ctx, SSL_VERIFY_PEER, sslVerifyCallback );
+    }
+    /* default depth is nine ... leave this here in case it needs modification */
+    SSL_CTX_set_verify_depth( ctx, 9 );
+
+    /* ciphers */
+    if ( SSL_CTX_set_cipher_list( ctx, SSL_CIPHER_LIST ) != 1 ) {
+        sslLogError( "sslInit: couldn't set the cipher list (no valid ciphers)" );
+        SSL_CTX_free( ctx );
+        return NULL;
+    }
+
+    return ctx;
+}
+
+
+static SSL*
+sslInitSocket( SSL_CTX *ctx, int sock ) {
+    SSL *ssl;
+    BIO *bio;
+
+    bio = BIO_new_socket( sock, BIO_NOCLOSE );
+    if ( bio == NULL ) {
+        sslLogError( "sslInitSocket: BIO allocation error" );
+        return NULL;
+    }
+    ssl = SSL_new( ctx );
+    if ( ssl == NULL ) {
+        sslLogError( "sslInitSocket: couldn't create a new SSL socket" );
+        BIO_free( bio );
+        return NULL;
+    }
+    SSL_set_bio( ssl, bio, bio );
+
+    return ssl;
+}
+
+
+int ssl_write_msg( SSL* ssl, const std::string& msg )
+{
+    int msg_len = msg.size();
+    SSL_write( ssl, &msg_len, sizeof( msg_len ) );
+    SSL_write( ssl, msg.c_str(), msg_len );
+    return msg_len;
+}
+
+
+int ssl_read_msg( SSL* ssl, std::string& msg_out )
+{
+    const int READ_LEN = 256;
+    char buffer[READ_LEN + 1];
+    int n_bytes = 0;
+    int total_bytes = 0;
+    int data_len = 0;
+    SSL_read( ssl, &data_len, sizeof( data_len ) );
+    std::string msg;
+    // read that many bytes into our buffer
+    while ( total_bytes < data_len ) {
+        memset( buffer, 0, READ_LEN + 1 );
+        int bytes_remaining = data_len - total_bytes;
+        if ( bytes_remaining < READ_LEN ) {
+            // can read rest of data in one go
+            n_bytes = SSL_read( ssl, buffer, bytes_remaining );
+        }
+        else {
+            // read max bytes into buffer
+            n_bytes = SSL_read( ssl, buffer, READ_LEN );
+        }
+        if ( n_bytes == -1 ) {
+            // error reading
+            break;
+        }
+        if ( n_bytes == 0 ) {
+            // no more data
+            break;
+        }
+        debug( "received " + std::to_string( n_bytes ) + " bytes: " + std::string( buffer ) );
+        msg.append( buffer );
+        total_bytes += n_bytes;
+    }
+    msg_out = msg;
+    return total_bytes;
+}
+
 /*
     Reads bytes from a socket and puts them in msg_out.
 
@@ -267,9 +453,6 @@ void read_from_server( int portno, std::string nonce, std::string& user_name, st
     int sockfd;
     struct sockaddr_in serv_addr;
     struct hostent* server;
-    //const int READ_LEN = 256;
-    //char buffer[READ_LEN + 1];
-    //memset( buffer, 0, READ_LEN + 1 );
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if ( sockfd < 0 ) {
         perror( "socket" );
@@ -289,15 +472,40 @@ void read_from_server( int portno, std::string nonce, std::string& user_name, st
         perror( "connect" );
         return;
     }
+    // turn on ssl
+    SSL_CTX *ctx = sslInit( NULL, NULL );
+    if ( !ctx ) {
+        rodsLog( LOG_ERROR, "could not initialize SSL context on client" );
+        close( sockfd );
+        return;
+    }
+    SSL* ssl = sslInitSocket( ctx, sockfd );
+    if ( !ssl ) {
+        rodsLog( LOG_ERROR, "could not initialize SSL on client socket" );
+        ERR_print_errors_fp( stdout );
+        close( sockfd );
+        return;
+    }
+    int status = SSL_connect( ssl );
+    if ( status != 1 ) {
+        rodsLog( LOG_ERROR, "ssl connect error" );
+        SSL_free( ssl );
+        SSL_CTX_free( ctx );
+        close( sockfd );
+        return;
+    }
+    // TODO peer validation
+
 
     // write nonce to server to verify that we are the same client that the auth req came from
-    int msg_len = nonce.size();
-    write( sockfd, &msg_len, sizeof( msg_len ) );
-    write( sockfd, nonce.c_str(), msg_len );
+    //int msg_len = nonce.size();
+    //write( sockfd, &msg_len, sizeof( msg_len ) );
+    //write( sockfd, nonce.c_str(), msg_len );
+    ssl_write_msg( ssl, nonce );
 
     // read first 4 bytes (data length)
     std::string authorization_url_buf;
-    if ( read_msg( sockfd, authorization_url_buf ) < 0 ) {
+    if ( ssl_read_msg( ssl, authorization_url_buf ) < 0 ) {
         perror( "error reading url from socket" );
         return;
     }
@@ -313,14 +521,14 @@ void read_from_server( int portno, std::string nonce, std::string& user_name, st
     }
 
     // wait for username message now
-    if ( read_msg( sockfd, user_name ) < 0 ) {
+    if ( ssl_read_msg( ssl, user_name ) < 0 ) {
         perror( "error reading username from server" );
         return;
     }
     debug( "read user_name: " + user_name );
 
     // wait for session token now
-    int len = read_msg( sockfd, session_token );
+    int len = ssl_read_msg( ssl, session_token );
     if ( len < 0 ) {
         perror( "error reading session token from server" );
         return;
@@ -328,6 +536,8 @@ void read_from_server( int portno, std::string nonce, std::string& user_name, st
     debug( "read session token: " + session_token );
     debug( "session token length: " + std::to_string( len ) );
 
+    SSL_free( ssl );
+    SSL_CTX_free( ctx );
     close( sockfd );
     debug( "leaving read_from_server" );
 }
@@ -552,7 +762,7 @@ irods::error openid_auth_client_request(
 
     irods::kvp_map_t out_map;
     irods::parse_escaped_kvp_string( req_out->result_, out_map );
-    debug( "received comm info from server: port: [" + out_map["port"] + ", nonce: [" + out_map["nonce"] + "]" );
+    debug( "received comm info from server: port: [" + out_map["port"] + "], nonce: [" + out_map["nonce"] + "]" );
     int portno = std::stoi( out_map["port"] );
     std::string nonce = out_map["nonce"]; //
 
@@ -652,6 +862,89 @@ irods::error openid_auth_client_response(
 
 #ifdef RODS_SERVER
 static std::string openid_provider_name;
+
+#if OPENSSL_VERSION_NUMBER < 0x10100000
+#define ASN1_STRING_get0_data ASN1_STRING_data
+#define DH_set0_pqg(dh_, p_, q_, g_) \
+    dh_->p = p_; \
+    dh_->q = q_; \
+    dh_->g = g_;
+#endif
+
+static DH*
+get_dh2048() {
+    static unsigned char dh2048_p[] = {
+        0xF6, 0x42, 0x57, 0xB7, 0x08, 0x7F, 0x08, 0x17, 0x72, 0xA2, 0xBA, 0xD6,
+        0xA9, 0x42, 0xF3, 0x05, 0xE8, 0xF9, 0x53, 0x11, 0x39, 0x4F, 0xB6, 0xF1,
+        0x6E, 0xB9, 0x4B, 0x38, 0x20, 0xDA, 0x01, 0xA7, 0x56, 0xA3, 0x14, 0xE9,
+        0x8F, 0x40, 0x55, 0xF3, 0xD0, 0x07, 0xC6, 0xCB, 0x43, 0xA9, 0x94, 0xAD,
+        0xF7, 0x4C, 0x64, 0x86, 0x49, 0xF8, 0x0C, 0x83, 0xBD, 0x65, 0xE9, 0x17,
+        0xD4, 0xA1, 0xD3, 0x50, 0xF8, 0xF5, 0x59, 0x5F, 0xDC, 0x76, 0x52, 0x4F,
+        0x3D, 0x3D, 0x8D, 0xDB, 0xCE, 0x99, 0xE1, 0x57, 0x92, 0x59, 0xCD, 0xFD,
+        0xB8, 0xAE, 0x74, 0x4F, 0xC5, 0xFC, 0x76, 0xBC, 0x83, 0xC5, 0x47, 0x30,
+        0x61, 0xCE, 0x7C, 0xC9, 0x66, 0xFF, 0x15, 0xF9, 0xBB, 0xFD, 0x91, 0x5E,
+        0xC7, 0x01, 0xAA, 0xD3, 0x5B, 0x9E, 0x8D, 0xA0, 0xA5, 0x72, 0x3A, 0xD4,
+        0x1A, 0xF0, 0xBF, 0x46, 0x00, 0x58, 0x2B, 0xE5, 0xF4, 0x88, 0xFD, 0x58,
+        0x4E, 0x49, 0xDB, 0xCD, 0x20, 0xB4, 0x9D, 0xE4, 0x91, 0x07, 0x36, 0x6B,
+        0x33, 0x6C, 0x38, 0x0D, 0x45, 0x1D, 0x0F, 0x7C, 0x88, 0xB3, 0x1C, 0x7C,
+        0x5B, 0x2D, 0x8E, 0xF6, 0xF3, 0xC9, 0x23, 0xC0, 0x43, 0xF0, 0xA5, 0x5B,
+        0x18, 0x8D, 0x8E, 0xBB, 0x55, 0x8C, 0xB8, 0x5D, 0x38, 0xD3, 0x34, 0xFD,
+        0x7C, 0x17, 0x57, 0x43, 0xA3, 0x1D, 0x18, 0x6C, 0xDE, 0x33, 0x21, 0x2C,
+        0xB5, 0x2A, 0xFF, 0x3C, 0xE1, 0xB1, 0x29, 0x40, 0x18, 0x11, 0x8D, 0x7C,
+        0x84, 0xA7, 0x0A, 0x72, 0xD6, 0x86, 0xC4, 0x03, 0x19, 0xC8, 0x07, 0x29,
+        0x7A, 0xCA, 0x95, 0x0C, 0xD9, 0x96, 0x9F, 0xAB, 0xD0, 0x0A, 0x50, 0x9B,
+        0x02, 0x46, 0xD3, 0x08, 0x3D, 0x66, 0xA4, 0x5D, 0x41, 0x9F, 0x9C, 0x7C,
+        0xBD, 0x89, 0x4B, 0x22, 0x19, 0x26, 0xBA, 0xAB, 0xA2, 0x5E, 0xC3, 0x55,
+        0xE9, 0x32, 0x0B, 0x3B,
+    };
+    static unsigned char dh2048_g[] = {
+        0x02,
+    };
+    auto *dh = DH_new();
+
+    if ( !dh ) {
+        return NULL;
+    }
+    auto* p = BN_bin2bn( dh2048_p, sizeof( dh2048_p ), NULL );
+    auto* g = BN_bin2bn( dh2048_g, sizeof( dh2048_g ), NULL );
+    if ( !p || !g ) {
+        DH_free( dh );
+        return NULL;
+    }
+    DH_set0_pqg(dh, p, nullptr, g);
+    return dh;
+}
+
+
+static int
+sslLoadDHParams( SSL_CTX *ctx, char *file ) {
+    DH *dhparams = NULL;
+    BIO *bio;
+
+    if ( file ) {
+        bio = BIO_new_file( file, "r" );
+        if ( bio ) {
+            dhparams = PEM_read_bio_DHparams( bio, NULL, NULL, NULL );
+            BIO_free( bio );
+        }
+    }
+
+    if ( dhparams == NULL ) {
+        sslLogError( "sslLoadDHParams: can't load DH parameter file. Falling back to built-ins." );
+        dhparams = get_dh2048();
+        if ( dhparams == NULL ) {
+            rodsLog( LOG_ERROR, "sslLoadDHParams: can't load built-in DH params" );
+            return -1;
+        }
+    }
+
+    if ( SSL_CTX_set_tmp_dh( ctx, dhparams ) < 0 ) {
+        sslLogError( "sslLoadDHParams: couldn't set DH parameters" );
+        return -1;
+    }
+    return 0;
+}
+
 
 static irods::error _get_openid_config_string( std::string key, std::string& val )
 {
@@ -1432,13 +1725,37 @@ void open_write_to_port(
     socklen_t clilen;
     struct sockaddr_in cli_addr;
     clilen = sizeof( cli_addr );
-
+    
     r = bind_port( portno, &sockfd );
     if ( r < 0 ) {
         perror( "error binding to port" );
         throw std::runtime_error( "could not bind to port" );
     }
     std::cout << "bound to port: " << *portno << std::endl;
+
+    // it would be nice to reuse irods helper functions like ssl_init_socket, but they are all static
+    rodsEnv env;
+    int status = getRodsEnv( &env );
+    if ( status < 0 ) {
+        rodsLog( LOG_ERROR, "getRodsEnv failed: %d", status );
+        close( sockfd );
+        throw std::runtime_error( "getRodsEnv failed: " + std::to_string( status ) );
+    }
+
+    SSL_CTX *ctx = sslInit( 
+            env.irodsSSLCertificateChainFile,
+            env.irodsSSLCertificateKeyFile );
+    if ( !ctx ) {
+        std::cout << "failed to establish SSL context" << std::endl;
+        ERR_print_errors_fp( stdout );
+        throw std::runtime_error( "failed to establish SSL context" );
+    }
+    
+    status = sslLoadDHParams( ctx, env.irodsSSLDHParamsFile );
+    if ( status ) {
+        rodsLog( LOG_ERROR, "error loading DH params" );
+    }
+
     /////////////
 
     // notify that port is open so that main thread can continue and return
@@ -1449,16 +1766,34 @@ void open_write_to_port(
 
     // wait for a client connection
     conn_sockfd = accept( sockfd, (struct sockaddr*) &cli_addr, &clilen );
-    if ( conn_sockfd < 0 ) {
-        perror( "accept" );
-        close( sockfd );
-        return;
+    //SSL *ssl = SSL_new( ctx );
+    //SSL_set_fd( ssl, conn_sockfd );
+    SSL* ssl = sslInitSocket( ctx, conn_sockfd );
+    if ( !ssl ) {
+        rodsLog( LOG_ERROR, "could not initialize SSL on socket" );
+        ERR_print_errors_fp( stdout );
+        throw std::runtime_error( "could not initialize SSL on socket" );
+    }    
+    status = SSL_accept( ssl );
+    if ( status != 1 ) {
+        char buf[120];
+        int ssl_error_code = SSL_get_error( ssl, status );
+        ERR_error_string( ssl_error_code, buf );
+        rodsLog( LOG_ERROR, "Error accepting SSL connection: %d, %s", status, buf );
+        ERR_print_errors_fp( stdout );
+        SSL_free( ssl );
+        SSL_CTX_free( ctx );
+        throw std::runtime_error( "Error accepting SSL connection" );
     }
 
     // verify client nonce matches the nonce we sent back from auth_agent_request
     std::string client_nonce;
-    if ( read_msg( conn_sockfd, client_nonce ) < 0 ) {
+    if ( ssl_read_msg( ssl, client_nonce ) < 0 ) {
         perror( "error reading nonce from client" );
+        SSL_free( ssl );
+        SSL_CTX_free( ctx );
+        close( conn_sockfd );
+        close( sockfd );
         return;
     }
     std::cout << "received nonce from client: " << client_nonce << std::endl;
@@ -1471,7 +1806,6 @@ void open_write_to_port(
                  client_nonce.c_str() );
     }
     std::string msg;
-    int msg_len;
     bool authorized = false;
     json_t *resp_root = NULL;
     long status_code;
@@ -1497,9 +1831,13 @@ void open_write_to_port(
         std::cout << "user had no subject id" << std::endl;
         json_decref( resp_root );
         msg = "error checking session validity";
-        msg_len = msg.size();
-        write( conn_sockfd, &msg_len, sizeof( msg_len ) );
-        write( conn_sockfd, msg.c_str(), msg_len );
+        ssl_write_msg( ssl, msg );
+        //msg_len = msg.size();
+        //write( conn_sockfd, &msg_len, sizeof( msg_len ) );
+        //write( conn_sockfd, msg.c_str(), msg_len );
+        //close( conn_sockfd );
+        SSL_free( ssl );
+        SSL_CTX_free( ctx );
         close( conn_sockfd );
         close( sockfd );
         delete write_thread;
@@ -1509,6 +1847,7 @@ void open_write_to_port(
     std::cout << "user had subject_id: " << subject_id << std::endl;
 
     // check if the session is valid in the token service
+    // TODO CHECK RESP uid field against this user's auth-name
     ret = token_service_get_by_subject( subject_id, openid_provider_name, "openid", &status_code, &resp_root );
     if ( !ret.ok() ) {
         std::cout << "first token_service_get failed" << std::endl;
@@ -1516,9 +1855,13 @@ void open_write_to_port(
         //return ret;
         rodsLog( LOG_ERROR, ret.result().c_str() );
         msg = "error checking session validity";
-        msg_len = msg.size();
-        write( conn_sockfd, &msg_len, sizeof( msg_len ) );
-        write( conn_sockfd, msg.c_str(), msg_len );
+        //msg_len = msg.size();
+        //write( conn_sockfd, &msg_len, sizeof( msg_len ) );
+        //write( conn_sockfd, msg.c_str(), msg_len );
+        //close( conn_sockfd );
+        ssl_write_msg( ssl, msg );
+        SSL_free( ssl );
+        SSL_CTX_free( ctx );
         close( conn_sockfd );
         close( sockfd );
         delete write_thread;
@@ -1558,18 +1901,21 @@ void open_write_to_port(
         rodsLog( LOG_NOTICE, "session is valid" );
         // send back SUCCESS
         msg = OPENID_SESSION_VALID;
-        msg_len = msg.size();
-        write( conn_sockfd, &msg_len, sizeof( msg_len ) );
-        write( conn_sockfd, msg.c_str(), msg_len );
+        //msg_len = msg.size();
+        //write( conn_sockfd, &msg_len, sizeof( msg_len ) );
+        //write( conn_sockfd, msg.c_str(), msg_len );
+        ssl_write_msg( ssl, msg );
 
-        msg_len = user_name.size();
-        write( conn_sockfd, &msg_len, sizeof( msg_len ) );
-        write( conn_sockfd, user_name.c_str(), msg_len );
+        //msg_len = user_name.size();
+        //write( conn_sockfd, &msg_len, sizeof( msg_len ) );
+        //write( conn_sockfd, user_name.c_str(), msg_len );
+        ssl_write_msg( ssl, user_name );
 
         // send back session_id
-        msg_len = session_id.size();
-        write( conn_sockfd, &msg_len, sizeof( msg_len ) );
-        write( conn_sockfd, session_id.c_str(), msg_len );
+        //msg_len = session_id.size();
+        //write( conn_sockfd, &msg_len, sizeof( msg_len ) );
+        //write( conn_sockfd, session_id.c_str(), msg_len );
+        ssl_write_msg( ssl, session_id );
 
         rodsLog( LOG_NOTICE, "wrote (msg,user,sess) to client: (%s,%s,%s)",
                 OPENID_SESSION_VALID.c_str(),
@@ -1588,16 +1934,21 @@ void open_write_to_port(
         else {
             // TODO cleanup?
             rodsLog( LOG_ERROR, "could not parse response from token service" );
+            SSL_free( ssl );
+            SSL_CTX_free( ctx );
+            close( conn_sockfd );
+            close( sockfd );
             return;
         } 
 
         // send back [url] send blocking to token service
         // if 200 send back [username, session id]
         // else send back [FAILURE, FAILURE]
-        msg_len = msg.size();
-        write( conn_sockfd, &msg_len, sizeof( msg_len ) );
-        write( conn_sockfd, msg.c_str(), msg_len );
-        
+        //msg_len = msg.size();
+        //write( conn_sockfd, &msg_len, sizeof( msg_len ) );
+        //write( conn_sockfd, msg.c_str(), msg_len );
+        ssl_write_msg( ssl, msg );
+
         // block against token service for 60 seconds
         json_t *poll_resp_root;
         long poll_status_code;
@@ -1658,15 +2009,17 @@ void open_write_to_port(
                     session_id = existing_session_id;
                 }
                 // send back the user name
-                msg_len = user_name.size();
-                write( conn_sockfd, &msg_len, sizeof( msg_len ) );
-                write( conn_sockfd, user_name.c_str(), msg_len );
+                //msg_len = user_name.size();
+                //write( conn_sockfd, &msg_len, sizeof( msg_len ) );
+                //write( conn_sockfd, user_name.c_str(), msg_len );
+                ssl_write_msg( ssl, user_name );
 
                 // send back the session id
-                msg_len = session_id.size();
-                write( conn_sockfd, &msg_len, sizeof( msg_len ) );
-                write( conn_sockfd, session_id.c_str(), msg_len );
-                
+                //msg_len = session_id.size();
+                //write( conn_sockfd, &msg_len, sizeof( msg_len ) );
+                //write( conn_sockfd, session_id.c_str(), msg_len );
+                ssl_write_msg( ssl, session_id );
+
                 rodsLog( LOG_NOTICE, "wrote (msg,user,sess) to client: (%s,%s,%s)",
                         msg.c_str(),
                         user_name.c_str(),
@@ -1693,6 +2046,8 @@ void open_write_to_port(
     }
 
     // close client connection
+    SSL_free( ssl );
+    SSL_CTX_free( ctx );
     close( conn_sockfd );
 
     // close server socket

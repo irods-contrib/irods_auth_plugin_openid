@@ -105,6 +105,7 @@ foreach(TYPE ${IRODS_PLUGIN_TYPES})
     ${IRODS_EXTERNALS_FULLPATH_BOOST}/include
     ${IRODS_EXTERNALS_FULLPATH_JANSSON}/include
     ${CURL_INCLUDE_DIRS}
+    ${OPENSSL_INCLUDE_DIR}
     )
   target_link_libraries(
     ${IRODS_CURRENT_PLUGIN_TARGET}
@@ -113,6 +114,7 @@ foreach(TYPE ${IRODS_PLUGIN_TYPES})
     irods_common
     irods_plugin_dependencies
     ${OPENSSL_CRYPTO_LIBRARY}
+    ${OPENSSL_LIBRARIES}
     ${GSS_LIBRARIES}
     ${CURL_LIBRARIES}
     pthread
