@@ -9,6 +9,8 @@
 #include "genQuery.h"
 #include "irods_auth_constants.hpp"
 #include "irods_auth_plugin.hpp"
+#include "irods_auth_factory.hpp"
+#include "irods_auth_manager.hpp"
 #include "irods_client_server_negotiation.hpp"
 #include "irods_configuration_keywords.hpp"
 #include "irods_error.hpp"
@@ -55,6 +57,8 @@
 #include <boost/algorithm/string.hpp>
 #include "base64.h"
 #include "jansson.h"
+
+#include "libopenid.h"
 ///END OPENID includes
 ///DECLARATIONS
 
@@ -114,6 +118,76 @@ void debug( std::string msg )
     if ( openidDebug ) {
         puts( msg.c_str() );
     }
+}
+
+int
+clientLoginOpenID(
+    rcComm_t *_comm,
+    const char *_context )
+{
+    const char *auth_scheme = "openid";
+    // =-=-=-=-=-=-=-
+    // construct an auth object given the scheme
+    irods::auth_object_ptr auth_obj;
+    irods::error ret = irods::auth_factory( auth_scheme, _comm->rError, auth_obj );
+    if ( !ret.ok() ) {
+        irods::log( PASS( ret ) );
+        return ret.code();
+    }
+
+    // =-=-=-=-=-=-=-
+    // resolve an auth plugin given the auth object
+    irods::plugin_ptr ptr;
+    ret = auth_obj->resolve( irods::AUTH_INTERFACE, ptr );
+    if ( !ret.ok() ) {
+        irods::log( PASS( ret ) );
+        return ret.code();
+    }
+    irods::auth_ptr auth_plugin = boost::dynamic_pointer_cast< irods::auth >( ptr );
+
+    // =-=-=-=-=-=-=-
+    // call client side init
+    ret = auth_plugin->call <rcComm_t*, const char* > ( NULL, irods::AUTH_CLIENT_START, auth_obj, _comm, _context );
+    if ( !ret.ok() ) {
+        irods::log( PASS( ret ) );
+        return ret.code();
+    }
+    // =-=-=-=-=-=-=-
+    // send an authentication request to the server
+    ret = auth_plugin->call <rcComm_t* > ( NULL, irods::AUTH_CLIENT_AUTH_REQUEST, auth_obj, _comm );
+    if ( !ret.ok() ) {
+        printError(
+            _comm,
+            ret.code(),
+            ( char* )ret.result().c_str() );
+        return ret.code();
+    }
+
+    // =-=-=-=-=-=-=-
+    // establish auth context client side
+    ret = auth_plugin->call( NULL, irods::AUTH_ESTABLISH_CONTEXT, auth_obj );
+    if ( !ret.ok() ) {
+        irods::log( PASS( ret ) );
+        return ret.code();
+    }
+    // =-=-=-=-=-=-=-
+    // send the auth response to the agent
+    ret = auth_plugin->call <rcComm_t* > ( NULL, irods::AUTH_CLIENT_AUTH_RESPONSE, auth_obj, _comm );
+    if ( !ret.ok() ) {
+        printError(
+            _comm,
+            ret.code(),
+            ( char* )ret.result().c_str() );
+        return ret.code();
+    }
+
+    // =-=-=-=-=-=-=-
+    // set the flag stating we are logged in
+    _comm->loggedIn = 1;
+
+    // =-=-=-=-=-=-=-
+    // win!
+    return 0;
 }
 
 /*
@@ -562,7 +636,7 @@ irods::error openid_auth_client_start(
     rcComm_t*              _comm,
     const char*            _context_string)
 {
-    debug( "entering openid_auth_client_start" );
+    debug( "entering openid_auth_client_start, _context_string: " + std::string( _context_string ) );
     irods::error result = SUCCESS();
     irods::error ret;
 
