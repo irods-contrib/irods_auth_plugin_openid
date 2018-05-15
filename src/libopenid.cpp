@@ -636,7 +636,10 @@ irods::error openid_auth_client_start(
     rcComm_t*              _comm,
     const char*            _context_string)
 {
-    debug( "entering openid_auth_client_start, _context_string: " + std::string( _context_string ) );
+    debug( "entering openid_auth_client_start" );
+    if ( _context_string ) {
+        debug( "openid_auth_client_start,_context_string: " + std::string( _context_string ) );
+    }
     irods::error result = SUCCESS();
     irods::error ret;
 
