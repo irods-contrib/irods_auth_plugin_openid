@@ -58,7 +58,6 @@
 #include "base64.h"
 #include "jansson.h"
 
-#include "libopenid.h"
 ///END OPENID includes
 ///DECLARATIONS
 
@@ -120,75 +119,6 @@ void debug( std::string msg )
     }
 }
 
-int
-clientLoginOpenID(
-    rcComm_t *_comm,
-    const char *_context )
-{
-    const char *auth_scheme = "openid";
-    // =-=-=-=-=-=-=-
-    // construct an auth object given the scheme
-    irods::auth_object_ptr auth_obj;
-    irods::error ret = irods::auth_factory( auth_scheme, _comm->rError, auth_obj );
-    if ( !ret.ok() ) {
-        irods::log( PASS( ret ) );
-        return ret.code();
-    }
-
-    // =-=-=-=-=-=-=-
-    // resolve an auth plugin given the auth object
-    irods::plugin_ptr ptr;
-    ret = auth_obj->resolve( irods::AUTH_INTERFACE, ptr );
-    if ( !ret.ok() ) {
-        irods::log( PASS( ret ) );
-        return ret.code();
-    }
-    irods::auth_ptr auth_plugin = boost::dynamic_pointer_cast< irods::auth >( ptr );
-
-    // =-=-=-=-=-=-=-
-    // call client side init
-    ret = auth_plugin->call <rcComm_t*, const char* > ( NULL, irods::AUTH_CLIENT_START, auth_obj, _comm, _context );
-    if ( !ret.ok() ) {
-        irods::log( PASS( ret ) );
-        return ret.code();
-    }
-    // =-=-=-=-=-=-=-
-    // send an authentication request to the server
-    ret = auth_plugin->call <rcComm_t* > ( NULL, irods::AUTH_CLIENT_AUTH_REQUEST, auth_obj, _comm );
-    if ( !ret.ok() ) {
-        printError(
-            _comm,
-            ret.code(),
-            ( char* )ret.result().c_str() );
-        return ret.code();
-    }
-
-    // =-=-=-=-=-=-=-
-    // establish auth context client side
-    ret = auth_plugin->call( NULL, irods::AUTH_ESTABLISH_CONTEXT, auth_obj );
-    if ( !ret.ok() ) {
-        irods::log( PASS( ret ) );
-        return ret.code();
-    }
-    // =-=-=-=-=-=-=-
-    // send the auth response to the agent
-    ret = auth_plugin->call <rcComm_t* > ( NULL, irods::AUTH_CLIENT_AUTH_RESPONSE, auth_obj, _comm );
-    if ( !ret.ok() ) {
-        printError(
-            _comm,
-            ret.code(),
-            ( char* )ret.result().c_str() );
-        return ret.code();
-    }
-
-    // =-=-=-=-=-=-=-
-    // set the flag stating we are logged in
-    _comm->loggedIn = 1;
-
-    // =-=-=-=-=-=-=-
-    // win!
-    return 0;
-}
 
 /*
     Only systems with HOME defined
@@ -229,6 +159,7 @@ int write_sess_file( std::string val )
     debug( "leaving write_sess_file" );
     return 0;
 }
+extern "C"
 int read_sess_file( std::string& val_out )
 {
     debug( "entering read_sess_file" );
@@ -314,7 +245,6 @@ sslVerifyCallback( int ok, X509_STORE_CTX *store ) {
 static SSL_CTX*
 sslInit( char *certfile, char *keyfile ) {
     static int init_done = 0;
-
     rodsEnv env;
     int status = getRodsEnv( &env );
     if ( status < 0 ) {
@@ -323,9 +253,7 @@ sslInit( char *certfile, char *keyfile ) {
             "sslInit - failed in getRodsEnv : %d",
             status );
         return NULL;
-
     }
-
     if ( !init_done ) {
         SSL_library_init();
         SSL_load_error_strings();
@@ -570,11 +498,7 @@ void read_from_server( int portno, std::string nonce, std::string& user_name, st
     }
     // TODO peer validation
 
-
     // write nonce to server to verify that we are the same client that the auth req came from
-    //int msg_len = nonce.size();
-    //write( sockfd, &msg_len, sizeof( msg_len ) );
-    //write( sockfd, nonce.c_str(), msg_len );
     ssl_write_msg( ssl, nonce );
 
     // read first 4 bytes (data length)
@@ -657,34 +581,40 @@ irods::error openid_auth_client_start(
             // set the socket from the conn
             ptr->sock( _comm->sock );
 
-            // set the provider config to use, must match a provider configured on server
-            irods::kvp_map_t ctx_map;
-            std::string client_provider_cfg = irods::get_environment_property<std::string&>("openid_provider");
-            ctx_map["provider"] = client_provider_cfg;
-            debug( "client using provider: " + ctx_map["provider"] );
-
-            // set existing session id from pw file if exists
-            std::string sess_id;
-            int sess_ret = read_sess_file( sess_id );
-
-            if ( sess_ret < 0 || sess_id.size() == 0 ) {
-                std::cout << "No cached session file" << std::endl;
-                debug( "obfGetPw returned: " + std::to_string( sess_ret ) );
+            if ( _context_string && *_context_string ) {
+                // use an existing context string
+                ptr->context( _context_string );
             }
             else {
-                debug( "password file contains: " + std::string( sess_id ) );
-                // set the password in the context string
-                ctx_map[irods::AUTH_PASSWORD_KEY] = sess_id;
-            }
-            debug( "client startup context" );
-            for ( auto iter = ctx_map.begin(); iter != ctx_map.end(); ++iter ) {
-                debug( "key: " + iter->first + ", value: " + iter->second );
-            }
-            debug( "" );
+                // set the provider config to use, must match a provider configured on server
+                irods::kvp_map_t ctx_map;
+                std::string client_provider_cfg = irods::get_environment_property<std::string&>("openid_provider");
+                ctx_map["provider"] = client_provider_cfg;
+                debug( "client using provider: " + ctx_map["provider"] );
 
-            std::string new_context_str = irods::escaped_kvp_string( ctx_map );
-            debug( "setting context: " + new_context_str );
-            ptr->context( new_context_str );
+                // set existing session id from pw file if exists
+                std::string sess_id;
+                int sess_ret = read_sess_file( sess_id );
+
+                if ( sess_ret < 0 || sess_id.size() == 0 ) {
+                    std::cout << "No cached session file" << std::endl;
+                    debug( "obfGetPw returned: " + std::to_string( sess_ret ) );
+                }
+                else {
+                    debug( "password file contains: " + std::string( sess_id ) );
+                    // set the password in the context string
+                    ctx_map[irods::AUTH_PASSWORD_KEY] = sess_id;
+                }
+                debug( "client startup context" );
+                for ( auto iter = ctx_map.begin(); iter != ctx_map.end(); ++iter ) {
+                    debug( "key: " + iter->first + ", value: " + iter->second );
+                }
+                debug( "" );
+
+                std::string new_context_str = irods::escaped_kvp_string( ctx_map );
+                debug( "setting context: " + new_context_str );
+                ptr->context( new_context_str );
+            }
         }
     }
     debug( "leaving openid_auth_client_start" );
@@ -1308,7 +1238,226 @@ irods::error get_session_id_by_user_name( rsComm_t *comm, std::string user_name,
         freeGenQueryOut( &genQueryOut );
     }
     rodsLog( LOG_NOTICE, "leaving get_session_id_by_user_name with session_id: %s", session_id.c_str() );
+    return result;
+}
+
+irods::error user_has_subject_id(
+        rsComm_t *comm,
+        const std::string& user_name,
+        const std::string& subject_id,
+        bool *result )
+{
+    irods::error ret;
+    debug( "entering user_has_subject_id: " + user_name );
+    int status;
+    genQueryInp_t genQueryInp;
+    genQueryOut_t *genQueryOut;
+    memset( &genQueryInp, 0, sizeof ( genQueryInp_t ) );
+
+    // select
+    //addInxIval( &genQueryInp.selectInp, COL_META_USER_ATTR_NAME, 1 );
+    //addInxIval( &genQueryInp.selectInp, COL_META_USER_ATTR_VALUE, 1 );
+    addInxIval( &genQueryInp.selectInp, COL_USER_DN, 1 );
+    addInxIval( &genQueryInp.selectInp, COL_USER_NAME, 1 );
+
+    // where attr name matches
+    std::string w1;
+    w1 = "='";
+    w1 += user_name;
+    w1 += "'";
+    addInxVal( &genQueryInp.sqlCondInp, COL_USER_NAME, w1.c_str() );
+    
+    std::string w2;
+    w2 = "='";
+    w2 += subject_id;
+    w2 += "'";
+    addInxVal( &genQueryInp.sqlCondInp, COL_USER_DN, w2.c_str() );
+
+    genQueryInp.maxRows = 2;
+    status = rsGenQuery( comm, &genQueryInp, &genQueryOut );
+    if ( status == CAT_NO_ROWS_FOUND || status < 0 ) {
+        *result = false;
+    }
+    else {
+        *result = true;
+    }
+    if ( genQueryOut ) {
+        freeGenQueryOut( &genQueryOut );
+    }
+    debug( "leaving user_has_subject_id with: " + std::to_string( *result ) );
     return SUCCESS();
+}
+
+
+irods::error validate_user_token(
+        rsComm_t *comm,
+        const std::string& user_name,
+        const std::string& provider,
+        const std::string& token,
+        bool& is_valid )
+{
+    debug( "entering validate_user_token" );
+    irods::error result = SUCCESS();
+    irods::error ret;
+    std::string url;
+    ret = _get_openid_config_string( "token_service", url );
+    if ( !ret.ok() ) {
+        rodsLog( LOG_ERROR, "failed to look up token_service" );
+        return ret;
+    }
+    std::string api_key;
+    ret = _get_openid_config_string( "token_service_key", api_key );
+    if ( !ret.ok() ) {
+        rodsLog( LOG_ERROR, "failed to look up token_service_key" );
+        return ret;
+    }
+
+    // query the token resource
+    url += "/validate_token";
+
+    // add params conditionally
+    std::string params;
+
+    if ( provider.size() != 0 ) {
+        params += "provider=" + provider;
+    }
+    else {
+        return ERROR( SYS_INVALID_INPUT_PARAM, "provider cannot be empty" );
+    }
+    
+    if ( token.size() != 0 ) {
+        params += "&token=" + token;
+    }
+    else {
+        return ERROR( SYS_INVALID_INPUT_PARAM, "token cannot be empty" );
+    }
+
+    // create headers
+    std::vector<std::string> headers;
+    std::string authorization_header = "Authorization: Basic ";
+    authorization_header += api_key;
+    headers.push_back( authorization_header );
+    
+    long status_code;
+    std::string curl_resp;
+    bool curl_ret = curl_get( url, &params, &headers, &curl_resp, &status_code );
+    if ( !curl_ret ) {
+        rodsLog( LOG_ERROR, "failed request to url %s, returned status %ld", url.c_str(), status_code );
+        return ERROR( -1, "failure in curl request to token service" );
+    }
+    else {
+        rodsLog( LOG_NOTICE, "request to token_service succeeded" );
+    }
+   
+    if ( status_code != 200 ) {
+        std::ostringstream err_msg;
+        err_msg << "token service returned " << status_code << std::endl << curl_resp << std::endl;
+        rodsLog( LOG_ERROR, err_msg.str().c_str() );
+        return ERROR( -1, err_msg.str() );
+    }
+
+    json_error_t json_err;
+    json_t *resp_root = json_loads( curl_resp.c_str(), 0, &json_err );
+    if ( resp_root == NULL ) {
+        rodsLog( LOG_ERROR, "json_loads returned NULL" );
+        std::ostringstream msg;
+        msg << "error parsing response from token service: ";
+        msg << json_err_message( json_err );
+        std::cout << "status code: ";
+        std::cout << status_code;
+        std::cout << std::endl << "response: ";
+        std::cout << curl_resp;
+        rodsLog( LOG_ERROR, msg.str().c_str() );
+        return ERROR( -1, msg.str() );
+    }
+    json_t *sub_obj = json_object_get( resp_root, "sub" );
+    std::string subject_id;
+    if ( !json_is_string( sub_obj ) ) {
+        subject_id = json_string_value( sub_obj );
+    }
+    else {
+        return ERROR( -1, "no sub field returned in token validation" );
+    }
+    // see if this is a valid subject id for the user
+    bool user_has_sub = false;
+    ret = user_has_subject_id( comm, user_name, subject_id, &user_has_sub );
+    if ( !ret.ok() ) {
+        rodsLog( LOG_ERROR, "user_has_subject_id failed" );
+        is_valid = false;
+        result = ret;
+    }
+
+    // query succeeded, now set is_valid appropriately. result only means query succeeded
+    if ( user_has_sub ) {
+        is_valid = true;
+        result = SUCCESS();
+    }
+    else {
+        is_valid = false;
+        result = SUCCESS();
+    }
+    debug( "leaving validate_user_token" );
+    return SUCCESS();
+}
+
+
+/* Returns a 1 if the session exists for the user, otherwise 0
+ */
+int validate_user_session(
+        rsComm_t *comm,
+        const std::string& user_name,
+        const std::string& session_id )
+{
+    int result = 0;
+    irods::error ret = SUCCESS();
+    debug( "entering validate_user_session with session_id: " + session_id
+            + ", user_name: " + user_name );
+    int status;
+    genQueryInp_t genQueryInp;
+    genQueryOut_t *genQueryOut;
+    memset( &genQueryInp, 0, sizeof( genQueryInp_t ) );
+
+    // select
+    addInxIval( &genQueryInp.selectInp, COL_META_USER_ATTR_NAME, 1 );
+    addInxIval( &genQueryInp.selectInp, COL_META_USER_ATTR_VALUE, 1 );
+    addInxIval( &genQueryInp.selectInp, COL_USER_NAME, 1 );
+
+    // where meta attr name for user matches prefix OPENID_USER_METADATA_SESSION_PREFIX
+    std::string w1;
+    w1 = "='";
+    w1 += OPENID_USER_METADATA_SESSION_PREFIX;
+    w1 += "'";
+    addInxVal( &genQueryInp.sqlCondInp, COL_META_USER_ATTR_NAME, w1.c_str() );
+    
+    std::string w2;
+    w2 = " like '%";
+    w2 += "session_id=";
+    w2 += session_id;
+    w2 += "%'";
+    addInxVal( &genQueryInp.sqlCondInp, COL_META_USER_ATTR_VALUE, w2.c_str() );
+    
+    std::string w3;
+    w3 = "='";
+    w3 += user_name;
+    w3 += "'";
+    addInxVal( &genQueryInp.sqlCondInp, COL_USER_NAME, w3.c_str() );
+
+    genQueryInp.maxRows = 2;
+    status = rsGenQuery( comm, &genQueryInp, &genQueryOut );
+    if ( status == CAT_NO_ROWS_FOUND || status < 0 ) {
+        std::stringstream err_stream;
+        err_stream << "No results from rsGenQuery: " << status;
+        std::cout << err_stream.str() << std::endl;
+        result = 0;
+    }
+    else {
+        result = 1;
+    }
+    if ( genQueryOut ) {
+        freeGenQueryOut( &genQueryOut );
+    }
+    debug( "leaving validate_user_session" );
+    return result;
 }
 
 
@@ -1316,7 +1465,7 @@ irods::error get_subject_id_by_session_id( rsComm_t *comm, std::string session_i
 {
     irods::error ret;
     irods::error result = SUCCESS();
-    rodsLog( LOG_NOTICE, "entering get_subject_id_by_session_id with: %s", session_id.c_str() );
+    debug( "entering get_subject_id_by_session_id with: " + session_id );
     int status;
     genQueryInp_t genQueryInp;
     genQueryOut_t *genQueryOut;
@@ -1363,14 +1512,14 @@ irods::error get_subject_id_by_session_id( rsComm_t *comm, std::string session_i
     if ( genQueryOut ) {
         freeGenQueryOut( &genQueryOut );
     }
-    rodsLog( LOG_NOTICE, "leaving get_subject_id_by_session_id with subject_id: %s", subject_id.c_str() );
-    return SUCCESS();
+    debug( "leaving get_subject_id_by_session_id with subject_id: " + subject_id );
+    return result;
 }
 
 
 irods::error get_username_by_session_id( rsComm_t *comm, std::string session_id, std::string *user_name )
 {
-    std::cout << "entering get_username_by_session_id with: " << session_id << std::endl;
+    debug( "entering get_username_by_session_id with: " + session_id );
     irods::error result = SUCCESS();
     int status;
     genQueryInp_t genQueryInp;
@@ -1434,7 +1583,7 @@ irods::error get_username_by_session_id( rsComm_t *comm, std::string session_id,
     if ( genQueryOut ) {
         freeGenQueryOut( &genQueryOut );
     }
-    std::cout << "returning from get_username_by_session_id" << std::endl;
+    debug( "returning from get_username_by_session_id" );
     return result;
 }
 
@@ -1947,57 +2096,61 @@ void open_write_to_port(
     }
     else if ( authorized && status_code == 200 ) {
         debug( "token service returned 200" );
-        // this user has an icat session and still has an active session in the token microservice (not revoked or expired)
-        authorized = true;
+        json_t *uid_obj = json_object_get( resp_root, "uid" );
+        bool got_uid = json_is_string( uid_obj );
+        bool user_has_uid = false;
+        ret = user_has_subject_id(
+                        comm,
+                        user_name,
+                        std::string( json_string_value( uid_obj ) ),
+                        &user_has_uid ); 
+        if ( got_uid && user_has_uid  ) {
+            // this user has an icat session and still has an active session in the token microservice (not revoked or expired)
+            authorized = true;
         
-        // send back new session_id in case the token has been updated
-        // use existing session, not based on new token
-        /*
-        std::string current_access_token;
-        if ( json_is_string( json_object_get( resp_root, "access_token" ) ) ) {
-            current_access_token = json_string_value( json_object_get( resp_root, "access_token" ) );
+            // send back new session_id in case the token has been updated
+            // use existing session, not based on new token
+            /*
+            std::string current_access_token;
+            if ( json_is_string( json_object_get( resp_root, "access_token" ) ) ) {
+                current_access_token = json_string_value( json_object_get( resp_root, "access_token" ) );
+            }
+            else {
+                // TODO clean up
+                json_decref( resp_root );
+                rodsLog( LOG_ERROR, "could not parse response from token service" );
+                return;
+            }
+            char access_token_sha256[ 33 ];
+            _sha256_hash( current_access_token, access_token_sha256 );
+            std::cout << "sha256 token: ";
+            for ( int i = 0; i < 32; i++ ) {
+                printf( "%02X", (unsigned char)access_token_sha256[i] );
+            }
+            std::cout << std::endl;
+            // TODO remove this comment
+            //_hex_from_binary( access_token_sha256, 32, session_id );
+            */
+
+            rodsLog( LOG_NOTICE, "session is valid" );
+            // send back SUCCESS
+            msg = OPENID_SESSION_VALID;
+            ssl_write_msg( ssl, msg );
+            
+            // send back user_name
+            ssl_write_msg( ssl, user_name );
+
+            // send back session_id
+            ssl_write_msg( ssl, session_id );
+
+            rodsLog( LOG_NOTICE, "wrote (msg,user,sess) to client: (%s,%s,%s)",
+                    OPENID_SESSION_VALID.c_str(),
+                    user_name.c_str(),
+                    session_id.c_str() );
         }
         else {
-            // TODO clean up
-            json_decref( resp_root );
-            rodsLog( LOG_ERROR, "could not parse response from token service" );
-            return;
+            rodsLog( LOG_ERROR, "token existed, but uid in response did not belong to this iRODS user" );
         }
-        char access_token_sha256[ 33 ];
-        _sha256_hash( current_access_token, access_token_sha256 );
-        std::cout << "sha256 token: ";
-        for ( int i = 0; i < 32; i++ ) {
-            printf( "%02X", (unsigned char)access_token_sha256[i] );
-        }
-        std::cout << std::endl;
-        // TODO remove this comment
-        //_hex_from_binary( access_token_sha256, 32, session_id );
-        */
-        
-
-        rodsLog( LOG_NOTICE, "session is valid" );
-        // send back SUCCESS
-        msg = OPENID_SESSION_VALID;
-        //msg_len = msg.size();
-        //write( conn_sockfd, &msg_len, sizeof( msg_len ) );
-        //write( conn_sockfd, msg.c_str(), msg_len );
-        ssl_write_msg( ssl, msg );
-
-        //msg_len = user_name.size();
-        //write( conn_sockfd, &msg_len, sizeof( msg_len ) );
-        //write( conn_sockfd, user_name.c_str(), msg_len );
-        ssl_write_msg( ssl, user_name );
-
-        // send back session_id
-        //msg_len = session_id.size();
-        //write( conn_sockfd, &msg_len, sizeof( msg_len ) );
-        //write( conn_sockfd, session_id.c_str(), msg_len );
-        ssl_write_msg( ssl, session_id );
-
-        rodsLog( LOG_NOTICE, "wrote (msg,user,sess) to client: (%s,%s,%s)",
-                OPENID_SESSION_VALID.c_str(),
-                user_name.c_str(),
-                session_id.c_str() );
     } 
     else if ( !authorized || status_code == 401 ) {
         std::cout << "not authorized, user must re-authenticate" << std::endl;
@@ -2204,7 +2357,9 @@ irods::error openid_auth_agent_request(
         std::string port_str = std::to_string( portno );
         return_map["port"] = port_str;
         return_map["nonce"] = nonce; // client plugin must send this as first message when connecting to port
-        ptr->request_result( irods::escaped_kvp_string( return_map ) );
+        std::string result_string = irods::escaped_kvp_string( return_map );
+        rodsLog( LOG_NOTICE, "request_result: %s", result_string.c_str() );
+        ptr->request_result( result_string );
         write_thread->detach();
 
     } // end context check
