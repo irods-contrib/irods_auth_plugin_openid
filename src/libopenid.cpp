@@ -115,8 +115,17 @@ static bool openidDebug = true;
 void debug( std::string msg )
 {
     if ( openidDebug ) {
-        puts( msg.c_str() );
+        rodsLog( LOG_NOTICE, msg.c_str() );
     }
+}
+
+
+#include <fstream>
+void write_log( const std::string& msg )
+{
+    std::ofstream logfile( "/tmp/irodsserver.log", std::ios::out | std::ios::app );
+    logfile << msg << std::endl;
+    logfile.close();
 }
 
 
@@ -575,7 +584,7 @@ irods::error openid_auth_client_start(
             // set the user name from the conn
             ptr->user_name( _comm->proxyUser.userName );
 
-            // se the zone name from the conn
+            // set the zone name from the conn
             ptr->zone_name( _comm->proxyUser.rodsZone );
 
             // set the socket from the conn
@@ -616,6 +625,12 @@ irods::error openid_auth_client_start(
                 ptr->context( new_context_str );
             }
         }
+        else {
+            debug( "null comm pointer" );
+        }
+    }
+    else {
+        debug( "invalid plugin context" );
     }
     debug( "leaving openid_auth_client_start" );
     return result;
@@ -1248,7 +1263,7 @@ irods::error user_has_subject_id(
         bool *result )
 {
     irods::error ret;
-    debug( "entering user_has_subject_id: " + user_name );
+    debug( "entering user_has_subject_id with user_name:  " + user_name + ", subject_id: " + subject_id );
     int status;
     genQueryInp_t genQueryInp;
     genQueryOut_t *genQueryOut;
@@ -2052,7 +2067,7 @@ void open_write_to_port(
     std::cout << "session had subject_id: " << subject_id << std::endl;
 
     // get the subject id to use
-    ret = get_subject_id_by_user_name( comm, user_name, subject_id );
+    /*ret = get_subject_id_by_user_name( comm, user_name, subject_id );
     if ( !ret.ok() ) {
         std::cout << "user had no subject id" << std::endl;
         json_decref( resp_root );
@@ -2069,7 +2084,7 @@ void open_write_to_port(
         delete write_thread;
         write_thread = NULL;
         return;
-    }
+    }*/
     std::cout << "user had subject_id: " << subject_id << std::endl;
 
     // check if the session is valid in the token service
@@ -2105,6 +2120,7 @@ void open_write_to_port(
                         std::string( json_string_value( uid_obj ) ),
                         &user_has_uid ); 
         if ( got_uid && user_has_uid  ) {
+            subject_id = json_string_value( uid_obj );
             // this user has an icat session and still has an active session in the token microservice (not revoked or expired)
             authorized = true;
         
@@ -2160,23 +2176,22 @@ void open_write_to_port(
         ret = token_service_get_url( openid_provider_name, "openid", &status_code, &resp_root );
         if ( json_is_string( json_object_get( resp_root, "authorization_url" ) ) ) {
             msg = json_string_value( json_object_get( resp_root, "authorization_url" ) );
+            std::cout << "token service returned authorization url" << std::endl;
         }
         else {
             // TODO cleanup?
+            std::cout << "no authorization url returned from token service" << std::endl;
             rodsLog( LOG_ERROR, "could not parse response from token service" );
             SSL_free( ssl );
             SSL_CTX_free( ctx );
             close( conn_sockfd );
             close( sockfd );
             return;
-        } 
+        }
 
-        // send back [url] send blocking to token service
+        // send back auth url and poll for response
         // if 200 send back [username, session id]
         // else send back [FAILURE, FAILURE]
-        //msg_len = msg.size();
-        //write( conn_sockfd, &msg_len, sizeof( msg_len ) );
-        //write( conn_sockfd, msg.c_str(), msg_len );
         ssl_write_msg( ssl, msg );
 
         // block against token service for 60 seconds
@@ -2184,7 +2199,8 @@ void open_write_to_port(
         long poll_status_code;
         std::string nonce;
         ret = parse_nonce_from_authorization_url( msg, nonce );
-        //ret = token_service_get_by_subject( subject_id, openid_provider_name, "openid", 60, &block_status_code, &block_resp_root );
+        //ret = token_service_get_by_subject( subject_id,
+        //            openid_provider_name, "openid", 60, &block_status_code, &block_resp_root );
         size_t count = 20;
         size_t interval = 3; // poll every 3 sec for 1 min
         for ( size_t i = 0; i < count; i++ ) {
@@ -2208,8 +2224,9 @@ void open_write_to_port(
         if ( poll_status_code == 200 ) {
             // user logged in within 60 second limit
             json_t *token_obj = json_object_get( poll_resp_root, "access_token" );
-            if ( json_is_string( token_obj ) ) {
-
+            json_t *uid_obj = json_object_get( poll_resp_root, "uid" );
+            if ( json_is_string( token_obj ) && json_is_string( uid_obj ) ) {
+                subject_id = json_string_value( uid_obj );
                 // see if session id already exists for this user
                 std::string existing_session_id;
                 ret = get_session_id_by_user_name( comm, user_name, existing_session_id );
@@ -2218,12 +2235,16 @@ void open_write_to_port(
                     std::string access_token = json_string_value( token_obj );
                     char access_token_sha256[ 33 ];
                     _sha256_hash( access_token, access_token_sha256 );
-                    std::cout << "sha256 token: ";
+                    std::cout << "sha256 token hex: ";
                     for ( int i = 0; i < 32; i++ ) {
                         printf( "%02X", (unsigned char)access_token_sha256[i] );
                     }
                     std::cout << std::endl;
+                    
+                    // truncate hex to 50 char from 64 because davrods limts to 63 char pw
+                    // but irods obf technically limits to 50.
                     _hex_from_binary( access_token_sha256, 32, session_id );
+                    session_id.resize( 50 );
 
                     // write this new session to the database 
                     std::string metadata_key = OPENID_USER_METADATA_SESSION_PREFIX;
@@ -2236,18 +2257,13 @@ void open_write_to_port(
                 }
                 else {
                     // already has session id
+                    rodsLog( LOG_NOTICE, "using existing session_id" );
                     session_id = existing_session_id;
                 }
                 // send back the user name
-                //msg_len = user_name.size();
-                //write( conn_sockfd, &msg_len, sizeof( msg_len ) );
-                //write( conn_sockfd, user_name.c_str(), msg_len );
                 ssl_write_msg( ssl, user_name );
 
                 // send back the session id
-                //msg_len = session_id.size();
-                //write( conn_sockfd, &msg_len, sizeof( msg_len ) );
-                //write( conn_sockfd, session_id.c_str(), msg_len );
                 ssl_write_msg( ssl, session_id );
 
                 rodsLog( LOG_NOTICE, "wrote (msg,user,sess) to client: (%s,%s,%s)",
@@ -2276,8 +2292,12 @@ void open_write_to_port(
     }
 
     // close client connection
-    SSL_free( ssl );
-    SSL_CTX_free( ctx );
+    if ( ssl ) {
+        SSL_free( ssl );
+    }
+    if ( ctx ) {
+        SSL_CTX_free( ctx );
+    }
     close( conn_sockfd );
 
     // close server socket
@@ -2293,6 +2313,7 @@ void open_write_to_port(
 // called from rsAuthAgentRequest, which is called by rcAuthAgentRequest
 irods::error openid_auth_agent_request(
     irods::plugin_context& _ctx ) {
+
     std::cout << "entering openid_auth_agent_request" << std::endl;
     irods::error result = SUCCESS();
     irods::error ret;
@@ -2318,7 +2339,7 @@ irods::error openid_auth_agent_request(
             rodsLog( LOG_ERROR, "Could not parse context string sent from client: %s", ctx_str.c_str() );
             return PASS( ret );
         }
-        std::string session_id = ctx_map[irods::AUTH_PASSWORD_KEY];
+        std::string session_id = ctx_map["session_id"];
         std::string user_name = ctx_map[irods::AUTH_USER_KEY];
         // set global field to the value the client requested
         openid_provider_name = ctx_map["provider"];
@@ -2358,6 +2379,7 @@ irods::error openid_auth_agent_request(
         return_map["port"] = port_str;
         return_map["nonce"] = nonce; // client plugin must send this as first message when connecting to port
         std::string result_string = irods::escaped_kvp_string( return_map );
+        write_log( "request_result: " + result_string );
         rodsLog( LOG_NOTICE, "request_result: %s", result_string.c_str() );
         ptr->request_result( result_string );
         write_thread->detach();
