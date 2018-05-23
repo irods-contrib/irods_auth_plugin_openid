@@ -595,6 +595,7 @@ irods::error openid_auth_client_start(
                 ptr->context( _context_string );
             }
             else {
+                // No context sent, attempt to construct it now
                 // set the provider config to use, must match a provider configured on server
                 irods::kvp_map_t ctx_map;
                 std::string client_provider_cfg = irods::get_environment_property<std::string&>("openid_provider");
@@ -612,7 +613,8 @@ irods::error openid_auth_client_start(
                 else {
                     debug( "password file contains: " + std::string( sess_id ) );
                     // set the password in the context string
-                    ctx_map[irods::AUTH_PASSWORD_KEY] = sess_id;
+                    //ctx_map[irods::AUTH_PASSWORD_KEY] = sess_id;
+                    ctx_map["session_id"] = sess_id;
                 }
                 debug( "client startup context" );
                 for ( auto iter = ctx_map.begin(); iter != ctx_map.end(); ++iter ) {
@@ -1194,15 +1196,14 @@ irods::error get_subject_id_by_user_name( rsComm_t *comm, std::string user_name,
     // DO NOT ALLOW MULTIPLE DN VALUES
     else if ( genQueryOut->rowCnt > 1 ) {
         result = ERROR( -1, "user " + user_name + "has ambiguously defined authentication names" );
+        freeGenQueryOut( &genQueryOut );
     }
     else {
         char *value = genQueryOut->sqlResult[1].value;
         subject_id = value;
-    }
-
-    if ( genQueryOut ) {
         freeGenQueryOut( &genQueryOut );
     }
+
     rodsLog( LOG_NOTICE, "leaving get_subject_id_by_user_name with: %s", user_name.c_str() );
     return SUCCESS();
 }
@@ -1248,8 +1249,6 @@ irods::error get_session_id_by_user_name( rsComm_t *comm, std::string user_name,
         else {
             session_id = meta_map["session_id"];
         }
-    }
-    if ( genQueryOut ) {
         freeGenQueryOut( &genQueryOut );
     }
     rodsLog( LOG_NOTICE, "leaving get_session_id_by_user_name with session_id: %s", session_id.c_str() );
@@ -1295,8 +1294,6 @@ irods::error user_has_subject_id(
     }
     else {
         *result = true;
-    }
-    if ( genQueryOut ) {
         freeGenQueryOut( &genQueryOut );
     }
     debug( "leaving user_has_subject_id with: " + std::to_string( *result ) );
@@ -1467,8 +1464,6 @@ int validate_user_session(
     }
     else {
         result = 1;
-    }
-    if ( genQueryOut ) {
         freeGenQueryOut( &genQueryOut );
     }
     debug( "leaving validate_user_session" );
@@ -1481,6 +1476,9 @@ irods::error get_subject_id_by_session_id( rsComm_t *comm, std::string session_i
     irods::error ret;
     irods::error result = SUCCESS();
     debug( "entering get_subject_id_by_session_id with: " + session_id );
+    if ( session_id.size() == 0 ) {
+        return ERROR( SYS_INVALID_INPUT_PARAM, "session_id was empty" );
+    }
     int status;
     genQueryInp_t genQueryInp;
     genQueryOut_t *genQueryOut;
@@ -1523,8 +1521,6 @@ irods::error get_subject_id_by_session_id( rsComm_t *comm, std::string session_i
         else {
             subject_id = meta_map["subject_id"];
         }
-    }
-    if ( genQueryOut ) {
         freeGenQueryOut( &genQueryOut );
     }
     debug( "leaving get_subject_id_by_session_id with subject_id: " + subject_id );
@@ -1593,11 +1589,9 @@ irods::error get_username_by_session_id( rsComm_t *comm, std::string session_id,
         }
         *user_name = user_buf;
         rodsLog( LOG_NOTICE, "query for username by session_id returned: %s", user_buf );
-    }
-
-    if ( genQueryOut ) {
         freeGenQueryOut( &genQueryOut );
     }
+
     debug( "returning from get_username_by_session_id" );
     return result;
 }
@@ -1662,12 +1656,11 @@ irods::error get_token_meta_id(
         err_stream << scope << ")";
         std::cout << err_stream.str() << std::endl;
         result = ERROR( -1, err_stream.str() );
+        freeGenQueryOut( &genQueryOut );
     }
     else {
         char *id = genQueryOut->sqlResult[0].value + ( 0 * genQueryOut->sqlResult[0].len );
         meta_id = id;
-    }
-    if ( genQueryOut ) {
         freeGenQueryOut( &genQueryOut );
     }
     debug( "leaving get_token_meta_id" );
@@ -1721,6 +1714,7 @@ irods::error _token_service_get(
         long *status_code,
         json_t **resp_root )
 {
+    rodsLog( LOG_NOTICE, "entering _token_service_get" );
     irods::error ret;
     std::string url;
     ret = _get_openid_config_string( "token_service", url );
@@ -1811,7 +1805,7 @@ irods::error token_service_get_url(
         json_t **resp_root )
 
 {
-    std::cout << "entering token_service_get_url" << std::endl;
+    std::cout << "entering token_service_get_url, provider: " << provider << ", scope: " << scope << std::endl;
     return _token_service_get( "", provider, scope, "", status_code, resp_root );
 }
 
@@ -1839,7 +1833,7 @@ irods::error token_service_get_by_subject(
 
 
 /*  Need to synchronize between client and server.
-    Do not return from auth_agent_request until a port is open on the server because
+    Do not return from auth agent request until a port is open on the server because
     when client returns from rsAuthPluginRequest, it will read from this port */
 std::thread* write_thread = NULL;
 std::mutex port_mutex;
@@ -2049,7 +2043,7 @@ void open_write_to_port(
     std::string msg;
     bool authorized = false;
     json_t *resp_root = NULL;
-    long status_code;
+    long status_code = -1;
     std::string subject_id;
 
     // check if the session is valid in irods icat, ignore subject_id here
@@ -2085,31 +2079,29 @@ void open_write_to_port(
         write_thread = NULL;
         return;
     }*/
-    std::cout << "user had subject_id: " << subject_id << std::endl;
+    //std::cout << "user had subject_id: " << subject_id << std::endl;
 
     // check if the session is valid in the token service
     // TODO CHECK RESP uid field against this user's auth-name
-    ret = token_service_get_by_subject( subject_id, openid_provider_name, "openid", &status_code, &resp_root );
-    if ( !ret.ok() ) {
-        std::cout << "first token_service_get failed" << std::endl;
-        json_decref( resp_root );
-        //return ret;
-        rodsLog( LOG_ERROR, ret.result().c_str() );
-        msg = "error checking session validity";
-        //msg_len = msg.size();
-        //write( conn_sockfd, &msg_len, sizeof( msg_len ) );
-        //write( conn_sockfd, msg.c_str(), msg_len );
-        //close( conn_sockfd );
-        ssl_write_msg( ssl, msg );
-        SSL_free( ssl );
-        SSL_CTX_free( ctx );
-        close( conn_sockfd );
-        close( sockfd );
-        delete write_thread;
-        write_thread = NULL; 
-        return;
+    if ( subject_id.size() > 0 ) {
+        ret = token_service_get_by_subject( subject_id, openid_provider_name, "openid", &status_code, &resp_root );
+        if ( !ret.ok() ) {
+            std::cout << "first token_service_get failed" << std::endl;
+            json_decref( resp_root );
+            //return ret;
+            rodsLog( LOG_ERROR, ret.result().c_str() );
+            msg = "error checking session validity";
+            ssl_write_msg( ssl, msg );
+            SSL_free( ssl );
+            SSL_CTX_free( ctx );
+            close( conn_sockfd );
+            close( sockfd );
+            delete write_thread;
+            write_thread = NULL; 
+            return;
+        }
     }
-    else if ( authorized && status_code == 200 ) {
+    if ( authorized && status_code == 200 ) {
         debug( "token service returned 200" );
         json_t *uid_obj = json_object_get( resp_root, "uid" );
         bool got_uid = json_is_string( uid_obj );
@@ -2166,9 +2158,10 @@ void open_write_to_port(
         }
         else {
             rodsLog( LOG_ERROR, "token existed, but uid in response did not belong to this iRODS user" );
+            authorized = false;
         }
     } 
-    else if ( !authorized || status_code == 401 ) {
+    if ( !authorized || status_code == 401 ) {
         std::cout << "not authorized, user must re-authenticate" << std::endl;
 
         // user either wasn't provided, wasn't valid, or the session was deactivated/invalid
@@ -2181,6 +2174,9 @@ void open_write_to_port(
         else {
             // TODO cleanup?
             std::cout << "no authorization url returned from token service" << std::endl;
+            char *resp = json_dumps( resp_root, JSON_INDENT(2) );
+            std::cout << resp << std::endl;
+            free( resp );
             rodsLog( LOG_ERROR, "could not parse response from token service" );
             SSL_free( ssl );
             SSL_CTX_free( ctx );
@@ -2339,7 +2335,10 @@ irods::error openid_auth_agent_request(
             rodsLog( LOG_ERROR, "Could not parse context string sent from client: %s", ctx_str.c_str() );
             return PASS( ret );
         }
-        std::string session_id = ctx_map["session_id"];
+        std::string session_id;
+        if ( ctx_map.find( "session_id" ) != ctx_map.end() ) {
+            session_id = ctx_map["session_id"];
+        }
         std::string user_name = ctx_map[irods::AUTH_USER_KEY];
         // set global field to the value the client requested
         openid_provider_name = ctx_map["provider"];
