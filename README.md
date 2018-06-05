@@ -26,6 +26,7 @@ $ curl -H "Authorization: Basic 55555555" "https://token.example.org/admin/key?o
 "openid_provider": <the-provider-shortname>
 ```
 8. iRODS v4.2.3 is installed
+9. iRODS SSL is configured server-side. This is a strict requirement.  Authentication with an iRODS server over the OpenID scheme will always use SSL/TLS and it will fail if no certificate is configured. (see: [server-ssl-setup](https://docs.irods.org/4.2.3/plugins/pluggable_authentication/#server-ssl-setup))
 
 ## Use
 Now this plugin can be installed on an iRODS server, and on the client system which will be used to access the iRODS server.

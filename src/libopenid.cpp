@@ -58,6 +58,15 @@
 #include "base64.h"
 #include "jansson.h"
 
+/*Adding for manual queries to r_user_session_key
+ */
+//#include "icatStructs.hpp"
+//#include "icatHighLevelRoutines.hpp"
+//#include "low_level_odbc.hpp"
+
+/************************************************/
+
+
 ///END OPENID includes
 ///DECLARATIONS
 
@@ -100,7 +109,7 @@ bool curl_get( std::string url, std::string *params, std::vector<std::string> *h
 ///END DECLARATIONS
 
 // increases output
-static bool openidDebug = true;
+static bool openidDebug = false;
 
 #define OPENID_COMM_PORT 1357
 #define OPENID_ACCESS_TOKEN_KEY "access_token"
@@ -521,7 +530,7 @@ void read_from_server( int portno, std::string nonce, std::string& user_name, st
     // TODO maybe find better way to signal a valid session,
     // debug issue with using empty message as url
     if ( authorization_url_buf.compare( OPENID_SESSION_VALID ) == 0 ) {
-        std::cout << "Session is valid" << std::endl;
+        rodsLog( LOG_DEBUG, "OpenID Session is valid" );
     }
     else {
         std::cout << "OpenID Authorization URL: \n" << authorization_url_buf << std::endl;
@@ -1161,7 +1170,7 @@ irods::error generate_authorization_url( std::string& urlBuf, std::string auth_s
     return SUCCESS();
 }
 
-
+/*
 irods::error get_subject_id_by_user_name( rsComm_t *comm, std::string user_name, std::string& subject_id )
 {
     irods::error ret;
@@ -1207,7 +1216,7 @@ irods::error get_subject_id_by_user_name( rsComm_t *comm, std::string user_name,
     rodsLog( LOG_NOTICE, "leaving get_subject_id_by_user_name with: %s", user_name.c_str() );
     return SUCCESS();
 }
-
+*/
 
 irods::error get_session_id_by_user_name( rsComm_t *comm, std::string user_name, std::string& session_id ) 
 {
@@ -1223,13 +1232,20 @@ irods::error get_session_id_by_user_name( rsComm_t *comm, std::string user_name,
     addInxIval( &genQueryInp.selectInp, COL_META_USER_ATTR_NAME, 1 );
     addInxIval( &genQueryInp.selectInp, COL_META_USER_ATTR_VALUE, 1 );
     addInxIval( &genQueryInp.selectInp, COL_USER_DN, 1 );
-    
+    addInxIval( &genQueryInp.selectInp, COL_USER_NAME, 1 );
+
     // where attr name matches
     std::string w1;
     w1 = "='";
     w1 += OPENID_USER_METADATA_SESSION_PREFIX;
     w1 += "'";
     addInxVal( &genQueryInp.sqlCondInp, COL_META_USER_ATTR_NAME, w1.c_str() );
+
+    std::string w2;
+    w2 = "='";
+    w2 += user_name;
+    w2 += "'";
+    addInxVal( &genQueryInp.sqlCondInp, COL_USER_NAME, w2.c_str() );
 
     genQueryInp.maxRows = 2;
     status = rsGenQuery( comm, &genQueryInp, &genQueryOut );
@@ -1300,13 +1316,40 @@ irods::error user_has_subject_id(
     return SUCCESS();
 }
 
+/*
+irods::error user_has_session(
+        rsComm_t *comm,
+        const std::string& user_name,
+        const std::string& session_id )
+{
+    icatSessionStruct *icss;
+    int stmtNum = -1;
+    int status = -1;
+    
+    // get db connection struct
+    status = chlGetRcs( &icss );
+    if ( status < 0 || icss == NULL ) {
+        return ERROR( CAT_NOT_OPEN, "failed to connect to icat" );
+    }
+    
+    const char *sql =
+    "select s.user_id, s.session_key, s.session_info, s.session_expiry_ts, u.user_name "
+    "from r_user_session_key as s "
+    "left join r_user_main u on s.user_id = u.user_id "
+    "where s.auth_scheme = 'openid';";
+
+    cllExecSqlWithResult( icss, &stmtNum, sql );
+}
+*/
 
 irods::error validate_user_token(
         rsComm_t *comm,
         const std::string& user_name,
         const std::string& provider,
         const std::string& token,
-        bool& is_valid )
+        bool& is_valid,
+        long& status_code,
+        std::string& subject_id )
 {
     debug( "entering validate_user_token" );
     irods::error result = SUCCESS();
@@ -1338,7 +1381,7 @@ irods::error validate_user_token(
     }
     
     if ( token.size() != 0 ) {
-        params += "&token=" + token;
+        params += "&access_token=" + token;
     }
     else {
         return ERROR( SYS_INVALID_INPUT_PARAM, "token cannot be empty" );
@@ -1350,7 +1393,6 @@ irods::error validate_user_token(
     authorization_header += api_key;
     headers.push_back( authorization_header );
     
-    long status_code;
     std::string curl_resp;
     bool curl_ret = curl_get( url, &params, &headers, &curl_resp, &status_code );
     if ( !curl_ret ) {
@@ -1382,12 +1424,27 @@ irods::error validate_user_token(
         rodsLog( LOG_ERROR, msg.str().c_str() );
         return ERROR( -1, msg.str() );
     }
+
+    json_t *active_obj = json_object_get( resp_root, "active" );
+    if ( json_is_boolean( active_obj ) ) {
+        is_valid = json_boolean_value( active_obj );
+    }
+    else {
+        json_decref( resp_root );
+        return ERROR( -1, "no active field returned in token validation" );
+    }
+
+    if ( !is_valid ) {
+        json_decref( resp_root );
+        return SUCCESS();
+    }
+
     json_t *sub_obj = json_object_get( resp_root, "sub" );
-    std::string subject_id;
-    if ( !json_is_string( sub_obj ) ) {
+    if ( json_is_string( sub_obj ) ) {
         subject_id = json_string_value( sub_obj );
     }
     else {
+        json_decref( resp_root );
         return ERROR( -1, "no sub field returned in token validation" );
     }
     // see if this is a valid subject id for the user
@@ -1399,7 +1456,7 @@ irods::error validate_user_token(
         result = ret;
     }
 
-    // query succeeded, now set is_valid appropriately. result only means query succeeded
+    // query succeeded, now update is_valid appropriately. result only means query succeeded
     if ( user_has_sub ) {
         is_valid = true;
         result = SUCCESS();
@@ -1408,6 +1465,7 @@ irods::error validate_user_token(
         is_valid = false;
         result = SUCCESS();
     }
+    json_decref( resp_root );
     debug( "leaving validate_user_token" );
     return SUCCESS();
 }
@@ -1947,12 +2005,13 @@ void open_write_to_port(
         rsComm_t* comm,
         int *portno,
         std::string nonce,
+        std::string access_token,
         std::string session_id,
         std::string user_name )
 {
     std::unique_lock<std::mutex> lock(port_mutex);
 
-    std::cout << "entering open_write_to_port with session_id: " << session_id << std::endl;
+    rodsLog( LOG_NOTICE, "entering open_write_to_port with session_id: %s", session_id.c_str() );
     irods::error ret;
     int r;
     //////////////
@@ -1960,7 +2019,7 @@ void open_write_to_port(
     socklen_t clilen;
     struct sockaddr_in cli_addr;
     clilen = sizeof( cli_addr );
-    
+
     r = bind_port( portno, &sockfd );
     if ( r < 0 ) {
         perror( "error binding to port" );
@@ -1985,7 +2044,7 @@ void open_write_to_port(
         ERR_print_errors_fp( stdout );
         throw std::runtime_error( "failed to establish SSL context" );
     }
-    
+
     status = sslLoadDHParams( ctx, env.irodsSSLDHParamsFile );
     if ( status ) {
         rodsLog( LOG_ERROR, "error loading DH params" );
@@ -2046,43 +2105,36 @@ void open_write_to_port(
     long status_code = -1;
     std::string subject_id;
 
-    // check if the session is valid in irods icat, ignore subject_id here
-    // if not, reauthenticate from scratch and create new metadata entry
-    ret = get_subject_id_by_session_id( comm, session_id, subject_id );
-    if ( !ret.ok() ) {
-        std::cout << "no subject id found for this session" << std::endl;
-        // no matching subject, query for token with empty uid param
-        subject_id = "";
-        authorized = false;
+    // access_token takes precedent over session_id
+    if ( access_token.size() > 0 ) {
+        bool is_valid = false;
+        ret = validate_user_token( comm, user_name, openid_provider_name, access_token, is_valid, status_code, subject_id );
+        authorized = is_valid;
+        if ( is_valid ) {
+            rodsLog( LOG_NOTICE, "access_token is valid" );
+        }
+        else {
+            rodsLog( LOG_WARNING, "access_token is not valid" );
+            subject_id = "";
+        }
     }
     else {
-        authorized = true;
+        // check if the session is valid in irods icat, ignore subject_id here
+        // if not, reauthenticate from scratch and create new metadata entry
+        ret = get_subject_id_by_session_id( comm, session_id, subject_id );
+        if ( !ret.ok() ) {
+            std::cout << "no subject id found for this session" << std::endl;
+            // no matching subject, query for token with empty uid param
+            subject_id = "";
+            authorized = false;
+        }
+        else {
+            authorized = true;
+        }
+        std::cout << "session had subject_id: " << subject_id << std::endl;
     }
-    std::cout << "session had subject_id: " << subject_id << std::endl;
-
-    // get the subject id to use
-    /*ret = get_subject_id_by_user_name( comm, user_name, subject_id );
-    if ( !ret.ok() ) {
-        std::cout << "user had no subject id" << std::endl;
-        json_decref( resp_root );
-        msg = "error checking session validity";
-        ssl_write_msg( ssl, msg );
-        //msg_len = msg.size();
-        //write( conn_sockfd, &msg_len, sizeof( msg_len ) );
-        //write( conn_sockfd, msg.c_str(), msg_len );
-        //close( conn_sockfd );
-        SSL_free( ssl );
-        SSL_CTX_free( ctx );
-        close( conn_sockfd );
-        close( sockfd );
-        delete write_thread;
-        write_thread = NULL;
-        return;
-    }*/
-    //std::cout << "user had subject_id: " << subject_id << std::endl;
 
     // check if the session is valid in the token service
-    // TODO CHECK RESP uid field against this user's auth-name
     if ( subject_id.size() > 0 ) {
         ret = token_service_get_by_subject( subject_id, openid_provider_name, "openid", &status_code, &resp_root );
         if ( !ret.ok() ) {
@@ -2100,9 +2152,6 @@ void open_write_to_port(
             write_thread = NULL; 
             return;
         }
-    }
-    if ( authorized && status_code == 200 ) {
-        debug( "token service returned 200" );
         json_t *uid_obj = json_object_get( resp_root, "uid" );
         bool got_uid = json_is_string( uid_obj );
         bool user_has_uid = false;
@@ -2110,56 +2159,37 @@ void open_write_to_port(
                         comm,
                         user_name,
                         std::string( json_string_value( uid_obj ) ),
-                        &user_has_uid ); 
-        if ( got_uid && user_has_uid  ) {
-            subject_id = json_string_value( uid_obj );
-            // this user has an icat session and still has an active session in the token microservice (not revoked or expired)
+                        &user_has_uid );
+        if ( got_uid && user_has_uid ) {
             authorized = true;
-        
-            // send back new session_id in case the token has been updated
-            // use existing session, not based on new token
-            /*
-            std::string current_access_token;
-            if ( json_is_string( json_object_get( resp_root, "access_token" ) ) ) {
-                current_access_token = json_string_value( json_object_get( resp_root, "access_token" ) );
-            }
-            else {
-                // TODO clean up
-                json_decref( resp_root );
-                rodsLog( LOG_ERROR, "could not parse response from token service" );
-                return;
-            }
-            char access_token_sha256[ 33 ];
-            _sha256_hash( current_access_token, access_token_sha256 );
-            std::cout << "sha256 token: ";
-            for ( int i = 0; i < 32; i++ ) {
-                printf( "%02X", (unsigned char)access_token_sha256[i] );
-            }
-            std::cout << std::endl;
-            // TODO remove this comment
-            //_hex_from_binary( access_token_sha256, 32, session_id );
-            */
-
-            rodsLog( LOG_NOTICE, "session is valid" );
-            // send back SUCCESS
-            msg = OPENID_SESSION_VALID;
-            ssl_write_msg( ssl, msg );
-            
-            // send back user_name
-            ssl_write_msg( ssl, user_name );
-
-            // send back session_id
-            ssl_write_msg( ssl, session_id );
-
-            rodsLog( LOG_NOTICE, "wrote (msg,user,sess) to client: (%s,%s,%s)",
-                    OPENID_SESSION_VALID.c_str(),
-                    user_name.c_str(),
-                    session_id.c_str() );
+            subject_id = json_string_value( uid_obj );
         }
         else {
-            rodsLog( LOG_ERROR, "token existed, but uid in response did not belong to this iRODS user" );
             authorized = false;
+            rodsLog( LOG_ERROR, "session was valid but uid did not belong to this iRODS user" );
         }
+    }
+    std::cout << "authorized: " << authorized << std::endl;
+    std::cout << "status_code: " << status_code << std::endl;
+    if ( authorized && status_code == 200 ) {
+        rodsLog( LOG_NOTICE, "session authorized and token service returned 200" );
+        // this user has an icat session and still has an active session in the token microservice (not revoked or expired)
+        
+        rodsLog( LOG_NOTICE, "session is valid" );
+        // send back SUCCESS
+        msg = OPENID_SESSION_VALID;
+        ssl_write_msg( ssl, msg );
+
+        // send back user_name
+        ssl_write_msg( ssl, user_name );
+
+        // send back session_id
+        ssl_write_msg( ssl, session_id );
+
+        rodsLog( LOG_NOTICE, "wrote (msg,user,sess) to client: (%s,%s,%s)",
+                OPENID_SESSION_VALID.c_str(),
+                user_name.c_str(),
+                session_id.c_str() );
     } 
     if ( !authorized || status_code == 401 ) {
         std::cout << "not authorized, user must re-authenticate" << std::endl;
@@ -2172,7 +2202,6 @@ void open_write_to_port(
             std::cout << "token service returned authorization url" << std::endl;
         }
         else {
-            // TODO cleanup?
             std::cout << "no authorization url returned from token service" << std::endl;
             char *resp = json_dumps( resp_root, JSON_INDENT(2) );
             std::cout << resp << std::endl;
@@ -2195,9 +2224,7 @@ void open_write_to_port(
         long poll_status_code;
         std::string nonce;
         ret = parse_nonce_from_authorization_url( msg, nonce );
-        //ret = token_service_get_by_subject( subject_id,
-        //            openid_provider_name, "openid", 60, &block_status_code, &block_resp_root );
-        size_t count = 20;
+        size_t count = 20; // TODO make configurable
         size_t interval = 3; // poll every 3 sec for 1 min
         for ( size_t i = 0; i < count; i++ ) {
             std::cout << "polling token service for nonce, count : " << i << std::endl;
@@ -2226,6 +2253,7 @@ void open_write_to_port(
                 // see if session id already exists for this user
                 std::string existing_session_id;
                 ret = get_session_id_by_user_name( comm, user_name, existing_session_id );
+                rodsLog( LOG_NOTICE, "user [%s] has session id [%s]", user_name.c_str(), existing_session_id.c_str() );
                 if ( !ret.ok() || existing_session_id.size() == 0 ) {
                     // no session id exists for this user
                     std::string access_token = json_string_value( token_obj );
@@ -2298,7 +2326,7 @@ void open_write_to_port(
 
     // close server socket
     close( sockfd );
-    std::cout << "leaving open_write_to_port" << std::endl;
+    rodsLog( LOG_NOTICE, "leaving open_write_to_port" );
     // done writing, reset thread pointer; // looks like agents are fresh processes, so this can be changed
     delete write_thread;
     write_thread = NULL;
@@ -2339,6 +2367,10 @@ irods::error openid_auth_agent_request(
         if ( ctx_map.find( "session_id" ) != ctx_map.end() ) {
             session_id = ctx_map["session_id"];
         }
+        std::string access_token;
+        if ( ctx_map.find( "access_token" ) != ctx_map.end() ) {
+            access_token = ctx_map["access_token"];
+        }
         std::string user_name = ctx_map[irods::AUTH_USER_KEY];
         // set global field to the value the client requested
         openid_provider_name = ctx_map["provider"];
@@ -2366,6 +2398,7 @@ irods::error openid_auth_agent_request(
                             _ctx.comm(),
                             &portno,
                             nonce,
+                            access_token,
                             session_id,
                             user_name);
         while ( !port_opened ) {
