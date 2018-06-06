@@ -978,6 +978,24 @@ sslLoadDHParams( SSL_CTX *ctx, char *file ) {
     return 0;
 }
 
+/*
+static irods::error _get_default_openid_provider( std::string& provider )
+{
+    try {
+        const auto default_provider = irods::get_server_property<const std::unordered_map<std::string,boost::any>>(
+                            std::vector<std::string>{
+                                irods::CFG_PLUGIN_CONFIGURATION_KW,
+                                "authentication",
+                                "openid",
+                                "default_provider"} );
+        provider = default_provider;
+    }
+    catch( const irods::exceptoin& e ) {
+        return irods::error( e );
+    }
+    return SUCCESS();
+}
+*/
 
 static irods::error _get_openid_config_string( std::string key, std::string& val )
 {
@@ -997,6 +1015,7 @@ static irods::error _get_openid_config_string( std::string key, std::string& val
     return SUCCESS();
 }
 
+/*
 static irods::error _get_provider_config( std::string key, boost::any& cfg )
 {
    try {
@@ -1018,12 +1037,15 @@ static irods::error _get_provider_config( std::string key, boost::any& cfg )
     }
     return SUCCESS();
 }
+*/
+
 
 /*
     Looks for a server_config.json string corresponding to key, withing hte openid config section.
     Sets buf to its value.
     If the config value for key is not a string, returns an error.
 */
+/*
 static irods::error _get_provider_string( std::string key, std::string& buf )
 {
     boost::any cfg;
@@ -1035,12 +1057,14 @@ static irods::error _get_provider_string( std::string key, std::string& buf )
     buf = value;
     return SUCCESS();
 }
+*/
 
 /*
     Looks for an array of strings in the openid config section of the server config, with the key "scopes".
     Pushes them into the scopes_out vector.  Does not remove existing contents of scopes_out.
     If no "scopes" key found in this provider's config, returns an error.
 */
+/*
 static irods::error _get_provider_scopes( std::vector<std::string>& scopes_out )
 {
     boost::any cfg;
@@ -1057,6 +1081,7 @@ static irods::error _get_provider_scopes( std::vector<std::string>& scopes_out )
     }
     return SUCCESS();
 }
+*/
 
 irods::error openid_auth_agent_start(
     irods::plugin_context& _ctx,
@@ -1113,7 +1138,7 @@ irods::error add_user_metadata( rsComm_t *comm, std::string user_name, std::stri
     return SUCCESS();
 }
 
-
+/*
 irods::error generate_authorization_url( std::string& urlBuf, std::string auth_state, std::string auth_nonce )
 {
     std::cout << "entering generate_authorization_url" << std::endl;
@@ -1169,6 +1194,7 @@ irods::error generate_authorization_url( std::string& urlBuf, std::string auth_s
     urlBuf = url_stream.str();
     return SUCCESS();
 }
+*/
 
 /*
 irods::error get_subject_id_by_user_name( rsComm_t *comm, std::string user_name, std::string& subject_id )
@@ -2373,7 +2399,17 @@ irods::error openid_auth_agent_request(
         }
         std::string user_name = ctx_map[irods::AUTH_USER_KEY];
         // set global field to the value the client requested
-        openid_provider_name = ctx_map["provider"];
+        if ( ctx_map.find( "provider" ) != ctx_map.end() ) {
+            openid_provider_name = ctx_map["provider"];
+        }
+        else {
+            // attempt to pull default provider
+            ret = _get_openid_config_string( "default_provider", openid_provider_name );
+            if ( !ret.ok() ) {
+                rodsLog( LOG_ERROR, "no provider specified by client and no default_provider configured on server" );
+                return ret;
+            }
+        }
         std::cout << "agent request received client session: " << session_id << std::endl;
 
         /*
