@@ -616,9 +616,20 @@ irods::error openid_auth_client_start(
                 // set the provider config to use, must match a provider configured on server
                 rodsLog( LOG_NOTICE, "attempting to build context from client" );
                 irods::kvp_map_t ctx_map;
-                std::string client_provider_cfg = irods::get_environment_property<std::string&>("openid_provider");
-                ctx_map["provider"] = client_provider_cfg;
-                debug( "client using provider: " + ctx_map["provider"] );
+                try {
+                    std::string client_provider_cfg = irods::get_environment_property<std::string&>( "openid_provider" );
+                    ctx_map["provider"] = client_provider_cfg;
+                    debug( "client using provider: " + ctx_map["provider"] );
+                }
+                catch ( const irods::exception& e ) {
+                    if ( e.code() == KEY_NOT_FOUND ) {
+                        rodsLog( LOG_DEBUG, "KEY_NOT_FOUND: openid_provider not defined" );
+                    }
+                    else {
+                        rodsLog( LOG_DEBUG, "unknown error" );
+                        irods::log( e );
+                    }
+                }
 
                 // set existing session from pw file if exists
                 std::string sess;
@@ -1989,7 +2000,7 @@ int bind_port( int *portno, int *sock_out )
             return ret;
         }
         int assigned_port = ntohs( serv_addr.sin_port );
-        std::cout << "assigned port: " << assigned_port << std::endl;
+        rodsLog( LOG_DEBUG, "assigned port: %d", assigned_port );
         *portno = assigned_port;
     }
     *sock_out = sockfd;
@@ -2068,6 +2079,7 @@ void open_write_to_port(
     struct sockaddr_in cli_addr;
     clilen = sizeof( cli_addr );
 
+    *portno = 52000;
     r = bind_port( portno, &sockfd );
     if ( r < 0 ) {
         perror( "error binding to port" );
@@ -2446,18 +2458,18 @@ irods::error openid_auth_agent_request(
             return PASS( ret );
         }
         std::string session_id;
-        if ( ctx_map.find( "session_id" ) != ctx_map.end() ) {
+        if ( ctx_map.count( "session_id" ) ) {
             session_id = ctx_map["session_id"];
             rodsLog( LOG_NOTICE, "openid agent received client session: [%s]", session_id.c_str() );
         }
         std::string access_token;
-        if ( ctx_map.find( "access_token" ) != ctx_map.end() ) {
+        if ( ctx_map.count( "access_token" ) ) {
             access_token = ctx_map["access_token"];
             rodsLog( LOG_NOTICE, "openid agent received client token: [%s]", access_token.c_str() );
         }
         std::string user_name = ctx_map[irods::AUTH_USER_KEY];
         // set global field to the value the client requested
-        if ( ctx_map.find( "provider" ) != ctx_map.end() ) {
+        if ( ctx_map.count( "provider" ) ) {
             openid_provider_name = ctx_map["provider"];
             rodsLog( LOG_NOTICE, "openid agent received client provider: [%s]", openid_provider_name.c_str() );
         }
