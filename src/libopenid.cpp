@@ -109,7 +109,9 @@ bool curl_get( std::string url, std::string *params, std::vector<std::string> *h
 ///END DECLARATIONS
 
 // increases output
-static bool openidDebug = false;
+static bool openidDebug = true;
+// alias log level. in prod set to LOG_DEBUG or LOG_DEBUG3
+#define DEBUG_FLAG LOG_NOTICE
 
 #define OPENID_COMM_PORT 1357
 #define OPENID_ACCESS_TOKEN_KEY "access_token"
@@ -537,7 +539,7 @@ void read_from_server( int portno, std::string nonce, std::string& user_name, st
     // TODO maybe find better way to signal a valid session,
     // debug issue with using empty message as url
     if ( authorization_url_buf.compare( OPENID_SESSION_VALID ) == 0 ) {
-        rodsLog( LOG_DEBUG, "OpenID Session is valid" );
+        rodsLog( DEBUG_FLAG, "OpenID Session is valid" );
     }
     else {
         std::cout << "OpenID Authorization URL: \n" << authorization_url_buf << std::endl;
@@ -1119,7 +1121,7 @@ static irods::error _get_provider_scopes( std::vector<std::string>& scopes_out )
 irods::error openid_auth_agent_start(
     irods::plugin_context& _ctx,
     const char*            _inst_name) {
-    rodsLog( LOG_DEBUG, "entering openid_auth_agent_start" );
+    rodsLog( DEBUG_FLAG, "entering openid_auth_agent_start" );
     irods::error result = SUCCESS();
     irods::error ret;
     ret = _ctx.valid<irods::generic_auth_object>();
@@ -1134,7 +1136,7 @@ irods::error openid_auth_agent_start(
         _ctx.comm()->auth_scheme = NULL;
 
     }
-    rodsLog( LOG_DEBUG, "leaving openid_auth_agent_start" );
+    rodsLog( DEBUG_FLAG, "leaving openid_auth_agent_start" );
     return result;
 }
 
@@ -1161,7 +1163,7 @@ irods::error add_user_metadata( rsComm_t *comm, std::string user_name, std::stri
     int old_auth_flag = comm->clientUser.authInfo.authFlag;
     comm->clientUser.authInfo.authFlag = LOCAL_PRIV_USER_AUTH;
     int avu_ret = rsModAVUMetadata( comm, &avu_inp );
-    rodsLog( LOG_DEBUG, "rsModAVUMetadata returned: %d", avu_ret );
+    rodsLog( DEBUG_FLAG, "rsModAVUMetadata returned: %d", avu_ret );
     // RESET PRIV LEVEL
     comm->clientUser.authInfo.authFlag = old_auth_flag;
 
@@ -2000,7 +2002,7 @@ int bind_port( int *portno, int *sock_out )
             return ret;
         }
         int assigned_port = ntohs( serv_addr.sin_port );
-        rodsLog( LOG_DEBUG, "assigned port: %d", assigned_port );
+        rodsLog( DEBUG_FLAG, "assigned port: %d", assigned_port );
         *portno = assigned_port;
     }
     *sock_out = sockfd;
@@ -2070,7 +2072,7 @@ void open_write_to_port(
 {
     std::unique_lock<std::mutex> lock(port_mutex);
 
-    rodsLog( LOG_NOTICE, "entering open_write_to_port with session_id: %s", session_id.c_str() );
+    rodsLog( DEBUG_FLAG, "entering open_write_to_port with session_id: %s", session_id.c_str() );
     irods::error ret;
     int r;
     //////////////
@@ -2079,7 +2081,6 @@ void open_write_to_port(
     struct sockaddr_in cli_addr;
     clilen = sizeof( cli_addr );
 
-    *portno = 52000;
     r = bind_port( portno, &sockfd );
     if ( r < 0 ) {
         perror( "error binding to port" );
@@ -2113,7 +2114,7 @@ void open_write_to_port(
     /////////////
 
     // notify that port is open so that main thread can continue and return
-    std::cout << "notifying port_is_open_cond" << std::endl;
+    rodsLog( DEBUG_FLAG, "notifying port_is_open_cond" );
     port_opened = true;
     lock.unlock();
     port_is_open_cond.notify_all();
@@ -2150,7 +2151,7 @@ void open_write_to_port(
         close( sockfd );
         return;
     }
-    std::cout << "received nonce from client: " << client_nonce << std::endl;
+    rodsLog( DEBUG_FLAG, "received nonce from client: %s", client_nonce.c_str() );
 
     if ( nonce.compare( client_nonce ) != 0 ) {
         rodsLog( LOG_WARNING,
@@ -2278,12 +2279,12 @@ void open_write_to_port(
         ret = token_service_get_url( openid_provider_name, "openid", &status_code, &resp_root );
         if ( json_is_string( json_object_get( resp_root, "authorization_url" ) ) ) {
             msg = json_string_value( json_object_get( resp_root, "authorization_url" ) );
-            rodsLog( LOG_DEBUG, "token service returned authorization url: [%s]", msg.c_str() );
+            rodsLog( DEBUG_FLAG, "token service returned authorization url: [%s]", msg.c_str() );
         }
         else {
-            rodsLog( LOG_DEBUG, "no authorization url returned from token service" );
+            rodsLog( DEBUG_FLAG, "no authorization url returned from token service" );
             char *resp = json_dumps( resp_root, JSON_INDENT(2) );
-            rodsLog( LOG_DEBUG, "%s", resp );
+            rodsLog( DEBUG_FLAG, "%s", resp );
             free( resp );
             rodsLog( LOG_ERROR, "could not parse response from token service" );
             SSL_free( ssl );
@@ -2401,7 +2402,7 @@ void open_write_to_port(
         }
     }
     else {
-        rodsLog( LOG_NOTICE, "token service returned status [%ld] on initial token request", status_code );
+        rodsLog( DEBUG_FLAG, "token service returned status [%ld] on initial token request", status_code );
     }
     
     // free json from first call to token service
@@ -2420,7 +2421,7 @@ void open_write_to_port(
 
     // close server socket
     close( sockfd );
-    rodsLog( LOG_NOTICE, "leaving open_write_to_port" );
+    rodsLog( DEBUG_FLAG, "leaving open_write_to_port" );
     // done writing, reset thread pointer; // looks like agents are fresh processes, so this can be changed
     delete write_thread;
     write_thread = NULL;
@@ -2450,7 +2451,7 @@ irods::error openid_auth_agent_request(
 
         // print the context string, this should have the user/sess in it
         std::string ctx_str = ptr->context();
-        std::cout << "auth_agent_request got context: " << ctx_str << std::endl;
+        rodsLog( DEBUG_FLAG, "auth_agent_request got context: %s", ctx_str.c_str() );
         irods::kvp_map_t ctx_map;
         ret = irods::parse_escaped_kvp_string( ctx_str, ctx_map );
         if ( !ret.ok() ) {
@@ -2482,7 +2483,6 @@ irods::error openid_auth_agent_request(
             }
             rodsLog( LOG_NOTICE, "openid agent used default provider" );
         }
-        std::cout << "agent request received client session: " << session_id << std::endl;
 
         /*
             nonce:
