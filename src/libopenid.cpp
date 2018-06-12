@@ -47,6 +47,8 @@
 #include <condition_variable>
 #include <mutex>
 #include <regex>
+#include <random>
+#include <algorithm>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/types.h>
@@ -127,7 +129,8 @@ static bool openidDebug = true;
 void debug( std::string msg )
 {
     if ( openidDebug ) {
-        rodsLog( LOG_NOTICE, msg.c_str() );
+        //rodsLog( LOG_NOTICE, msg.c_str() );
+        puts( msg.c_str() );
     }
 }
 
@@ -495,7 +498,7 @@ void read_from_server( int portno, std::string nonce, std::string& user_name, st
     }
     memset( &serv_addr, 0, sizeof( serv_addr ) );
     serv_addr.sin_family = AF_INET;
-    memcpy( server->h_addr, &serv_addr.sin_addr.s_addr, server->h_length );
+    memcpy( &serv_addr.sin_addr.s_addr, server->h_addr, server->h_length );
     serv_addr.sin_port = htons( portno );
     if ( connect( sockfd, (struct sockaddr*)&serv_addr, sizeof( serv_addr ) ) < 0 ) {
         perror( "connect" );
@@ -1031,6 +1034,63 @@ static irods::error _get_default_openid_provider( std::string& provider )
     return SUCCESS();
 }
 */
+
+static irods::error _get_openid_port_range( int& min_out, int& max_out )
+{
+    bool max_defined = false;
+    bool min_defined = false;
+    int min, max;
+    try {
+        const auto max_val = irods::get_server_property<const int&>(
+                                std::vector<std::string>{
+                                irods::CFG_PLUGIN_CONFIGURATION_KW,
+                                "authentication",
+                                "openid",
+                                "token_exchange_max_port" } );
+        max = max_val;
+        max_defined = true;
+    }
+    catch ( const irods::exception& e ) {
+        // suppress
+    }
+    try {
+        const auto min_val = irods::get_server_property<const int&>(
+                                std::vector<std::string>{
+                                irods::CFG_PLUGIN_CONFIGURATION_KW,
+                                "authentication",
+                                "openid",
+                                "token_exchange_min_port" } );
+        min = min_val;
+        min_defined = true;
+    }
+    catch( const irods::exception& e ) {
+        // suppress
+    }
+
+    if ( min_defined && max_defined ) {
+        if ( max < min ) {
+            int t = min;
+            min = max;
+            max = t;
+        }
+        min_out = min;
+        max_out = max;
+        return SUCCESS();
+    }
+    else if ( !( min_defined && max_defined ) ) {
+        min_out = 0;
+        max_out = 0; // use random os-assigned ports
+        return SUCCESS();
+    }
+    else if ( !min_defined && max_defined ) {
+        return ERROR( SYS_INVALID_INPUT_PARAM, "if token_exchange_max_port is defined, token_exchange_min_port must also be defined" );
+    }
+    else if ( min_defined && !max_defined ) {
+        return ERROR( SYS_INVALID_INPUT_PARAM, "if token_exchange_min_port is defined, token_exchange_max_port must also be defined" );
+    }
+    
+    return ERROR( -1, "Could not get port range for openid" );
+}
 
 static irods::error _get_openid_config_string( std::string key, std::string& val )
 {
@@ -1966,7 +2026,7 @@ bool port_opened = false;
 
     On error return negative. On success return 0.
 */
-int bind_port( int *portno, int *sock_out )
+int bind_port( int min_port, int max_port, int *port_out, int *sock_out )
 {
     int sockfd;
     struct sockaddr_in serv_addr;
@@ -1975,36 +2035,65 @@ int bind_port( int *portno, int *sock_out )
         perror( "socket" );
         return sockfd;
     }
+    int ret = -1;
     int opt_val = 1;
     setsockopt( sockfd, SOL_SOCKET, SO_REUSEADDR, (const void*)&opt_val, sizeof( opt_val ) );
     memset( &serv_addr, 0, sizeof( serv_addr ) );
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_addr.s_addr = INADDR_ANY;
-    serv_addr.sin_port = htons( *portno );
-    int ret;
-    ret = bind( sockfd, (struct sockaddr*)&serv_addr, sizeof( serv_addr ) );
-    if ( ret < 0 ) {
-        std::stringstream err_stream( "error binding socket to port: " );
-        err_stream << *portno;
-        perror( err_stream.str().c_str() );
-        close( sockfd );
-        return ret;
+    // single port specified (min==max)
+    if ( min_port == max_port ) {
+        serv_addr.sin_port = htons( min_port );
+        ret = bind( sockfd, (struct sockaddr*)&serv_addr, sizeof( serv_addr ) );
+        if ( ret < 0 ) {
+            std::stringstream err_stream( "error binding socket to port: " );
+            err_stream << min_port;
+            perror( err_stream.str().c_str() );
+            close( sockfd );
+            return ret;
+        }
+        *port_out = min_port;
+        if ( min_port == 0 ) {
+            socklen_t socklen = sizeof( serv_addr );
+            ret = getsockname( sockfd, (struct sockaddr*)&serv_addr, &socklen );
+            if ( ret < 0 ) {
+                close( sockfd );
+                perror( "error looking up socket for OS assigned port" );
+                return ret;
+            }
+            int assigned_port = ntohs( serv_addr.sin_port );
+            rodsLog( DEBUG_FLAG, "assigned port: %d", assigned_port );
+            *port_out = assigned_port;
+        }
+    }
+    else {
+        // random range
+        std::vector<int> ports;
+        for ( int i = min_port; i <= max_port; i++ ) {
+            ports.push_back( i );
+        }
+        //auto rng = randint;
+        std::srand( time( NULL ) );
+        auto rng = [](int i){ return std::rand() % i; };
+        //rng.seed( time( NULL ) );
+        std::random_shuffle( ports.begin(), ports.end(), rng );
+        bool bound = false;
+        for ( auto iter = ports.begin(); iter != ports.end(); iter++ ) {
+            serv_addr.sin_port = htons( *iter );
+            ret = bind( sockfd, (struct sockaddr*)&serv_addr, sizeof( serv_addr ) );
+            if ( ret == 0 ) {
+                bound = true;
+                *port_out = *iter;
+                rodsLog( DEBUG_FLAG, "bound random port: %d in range: [%d, %d]", *iter, min_port, max_port );
+            }
+        }
+        if ( !bound ) {
+            rodsLog( LOG_ERROR, "could not bind any ports in range: [%d, %d]", min_port, max_port );
+            return -1;
+        }
     }
     listen( sockfd, 1 );
 
-    // check random port assignment
-    if ( *portno == 0 ) {
-        socklen_t socklen = sizeof( serv_addr );
-        ret = getsockname( sockfd, (struct sockaddr*)&serv_addr, &socklen );
-        if ( ret < 0 ) {
-            close( sockfd );
-            perror( "error looking up socket for OS assigned port" );
-            return ret;
-        }
-        int assigned_port = ntohs( serv_addr.sin_port );
-        rodsLog( DEBUG_FLAG, "assigned port: %d", assigned_port );
-        *portno = assigned_port;
-    }
     *sock_out = sockfd;
     return 0;
 }
@@ -2080,13 +2169,20 @@ void open_write_to_port(
     socklen_t clilen;
     struct sockaddr_in cli_addr;
     clilen = sizeof( cli_addr );
-
-    r = bind_port( portno, &sockfd );
+    
+    // see if there is a range defined
+    int min, max;
+    ret = _get_openid_port_range( min, max );
+    if ( !ret.ok() ) {
+        rodsLog( LOG_ERROR, "open_write_to_port: failed to get port range" );
+        return;
+    }
+    r = bind_port( min, max, portno, &sockfd );
     if ( r < 0 ) {
         perror( "error binding to port" );
         throw std::runtime_error( "could not bind to port" );
     }
-    std::cout << "bound to port: " << *portno << std::endl;
+    rodsLog( DEBUG_FLAG, "bound to port: %d", *portno );
 
     // it would be nice to reuse irods helper functions like ssl_init_socket, but they are all static
     rodsEnv env;
@@ -2100,6 +2196,7 @@ void open_write_to_port(
     SSL_CTX *ctx = sslInit( 
             env.irodsSSLCertificateChainFile,
             env.irodsSSLCertificateKeyFile );
+    rodsLog( DEBUG_FLAG, "initialized ssl context" );
     if ( !ctx ) {
         std::cout << "failed to establish SSL context" << std::endl;
         ERR_print_errors_fp( stdout );
@@ -2121,15 +2218,18 @@ void open_write_to_port(
 
     // wait for a client connection
     conn_sockfd = accept( sockfd, (struct sockaddr*) &cli_addr, &clilen );
+    rodsLog( DEBUG_FLAG, "accepted tcp connection" );
     //SSL *ssl = SSL_new( ctx );
     //SSL_set_fd( ssl, conn_sockfd );
     SSL* ssl = sslInitSocket( ctx, conn_sockfd );
+    rodsLog( DEBUG_FLAG, "initialized ssl socket" );
     if ( !ssl ) {
         rodsLog( LOG_ERROR, "could not initialize SSL on socket" );
         ERR_print_errors_fp( stdout );
         throw std::runtime_error( "could not initialize SSL on socket" );
     }    
     status = SSL_accept( ssl );
+    rodsLog( DEBUG_FLAG, "accepted ssl handshake" );
     if ( status != 1 ) {
         char buf[120];
         int ssl_error_code = SSL_get_error( ssl, status );
@@ -2198,7 +2298,7 @@ void open_write_to_port(
         else {
             authorized = true;
         }
-        std::cout << "session had subject_id: " << subject_id << std::endl;
+        rodsLog( DEBUG_FLAG, "session had subject_id: %s", subject_id.c_str() );
     }
 
     // check if the session is valid in the token service
@@ -2244,10 +2344,9 @@ void open_write_to_port(
     //std::cout << "authorized: " << authorized << std::endl;
     //std::cout << "status_code: " << status_code << std::endl;
     if ( authorized && status_code == 200 ) {
-        rodsLog( LOG_NOTICE, "session authorized and token service returned 200" );
+        rodsLog( DEBUG_FLAG, "session authorized and token service returned 200" );
         // this user has an icat session and still has an active session in the token microservice (not revoked or expired)
         
-        rodsLog( LOG_NOTICE, "session is valid" );
         // send back SUCCESS
         msg = OPENID_SESSION_VALID;
         ssl_write_msg( ssl, msg );
@@ -2272,7 +2371,7 @@ void open_write_to_port(
                 sess.c_str() );
     } 
     if ( !authorized || status_code == 401 ) {
-        std::cout << "not authorized, user must re-authenticate" << std::endl;
+        rodsLog( LOG_NOTICE, "not authorized, user must re-authenticate" );
 
         // user either wasn't provided, wasn't valid, or the session was deactivated/invalid
         // user must re-authenticate
@@ -2307,7 +2406,7 @@ void open_write_to_port(
         size_t count = 20; // TODO make configurable
         size_t interval = 3; // poll every 3 sec for 1 min
         for ( size_t i = 0; i < count; i++ ) {
-            std::cout << "polling token service for nonce, count : " << i << std::endl;
+            rodsLog( DEBUG_FLAG, "polling token service for nonce, count: %ld", i );
             ret = token_service_get_by_nonce( openid_provider_name, "openid", nonce, &poll_status_code, &poll_resp_root );
             rodsLog( LOG_NOTICE, ret.result().c_str() );
             if ( poll_status_code < 400 ) {
@@ -2431,9 +2530,9 @@ void open_write_to_port(
 // server receives request from client
 // called from rsAuthAgentRequest, which is called by rcAuthAgentRequest
 irods::error openid_auth_agent_request(
-    irods::plugin_context& _ctx ) {
-
-    std::cout << "entering openid_auth_agent_request" << std::endl;
+    irods::plugin_context& _ctx )
+{
+    rodsLog( DEBUG_FLAG, "entering openid_auth_agent_request" );
     irods::error result = SUCCESS();
     irods::error ret;
     irods::generic_auth_object_ptr ptr;
@@ -2526,7 +2625,7 @@ irods::error openid_auth_agent_request(
 
     } // end context check
 
-    std::cout << "leaving openid_auth_agent_request" << std::endl;
+    rodsLog( DEBUG_FLAG, "leaving openid_auth_agent_request" );
     return SUCCESS();
 }
 
@@ -2559,8 +2658,9 @@ int check_proxy_user_privileges(
 
 irods::error openid_auth_agent_response(
     irods::plugin_context& _ctx,
-    authResponseInp_t* _resp ) {
-    std::cout << "entering openid_auth_agent_response" << std::endl;
+    authResponseInp_t* _resp )
+{
+    rodsLog( DEBUG_FLAG, "entering openid_auth_agent_response" );
     // =-=-=-=-=-=-=-
     // validate incoming parameters
     if ( !_ctx.valid().ok() ) {
@@ -2808,9 +2908,8 @@ irods::error openid_auth_agent_response(
     free( authCheckOut->serverResponse );
     free( authCheckOut );
 
-    std::cout << "leaving openid_auth_agent_response" << std::endl;
+    rodsLog( DEBUG_FLAG, "leaving openid_auth_agent_response" );
     return SUCCESS();
-
 }
 
 irods::error openid_auth_agent_verify(
