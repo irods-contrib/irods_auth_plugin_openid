@@ -37,10 +37,6 @@
 #include <string>
 
 ///OPENID includes
-// libhttp-parser-dev (ubuntu)
-// http-parser http-parser-devel (centos)
-//#include <http_parser.h> //TODO maybe convert custom http parsing in accept_request to use library
-
 #include <sstream>
 #include <map>
 #include <thread>
@@ -67,7 +63,6 @@
 //#include "low_level_odbc.hpp"
 
 /************************************************/
-
 
 ///END OPENID includes
 ///DECLARATIONS
@@ -479,7 +474,11 @@ int read_msg( int sockfd, std::string& msg_out )
     The server will wait for the callback request from this url.  After receiving the callback, it will read the tokens
     from the request and send the email and a session token in a 2nd and 3rd message respectively.
 */
-void read_from_server( int portno, std::string nonce, std::string& user_name, std::string& session_token )
+void read_from_server(
+        int portno,
+        std::string nonce,
+        std::string& user_name,
+        std::string& session_token )
 {
     debug( "entering read_from_server" );
     int sockfd;
@@ -545,7 +544,7 @@ void read_from_server( int portno, std::string nonce, std::string& user_name, st
         rodsLog( DEBUG_FLAG, "OpenID Session is valid" );
     }
     else {
-        std::cout << "OpenID Authorization URL: \n" << authorization_url_buf << std::endl;
+        std::cout << authorization_url_buf << std::endl;
     }
 
     // wait for username message now
@@ -591,8 +590,13 @@ irods::error openid_auth_client_start(
     const char*            _context_string)
 {
     debug( "entering openid_auth_client_start" );
-    if ( _context_string ) {
+    bool got_ctx = false;
+    if ( _context_string && *_context_string ) {
+        got_ctx = true;
         debug( "openid_auth_client_start,_context_string: " + std::string( _context_string ) );
+    }
+    else {
+        debug( "openid_auth_client_start, no _context_string" );
     }
     irods::error result = SUCCESS();
     irods::error ret;
@@ -611,16 +615,47 @@ irods::error openid_auth_client_start(
             // set the socket from the conn
             ptr->sock( _comm->sock );
 
-            if ( _context_string && *_context_string ) {
+            irods::kvp_map_t ctx_map;
+            if ( got_ctx ) {
+                rodsLog( DEBUG_FLAG, "using provided context string" );
+                irods::parse_escaped_kvp_string( _context_string, ctx_map );
                 // use an existing context string
-                rodsLog( LOG_NOTICE, "using existing context: %s", _context_string );
-                ptr->context( _context_string );
+                //rodsLog( LOG_NOTICE, "using existing context: %s", _context_string );
+                    //ptr->context( _context_string );
+            }
+
+            if ( ctx_map.count( "nobuildctx" ) > 0 ) {
+                if ( got_ctx ) {
+                    // check if iinit_arg was passed from an iinit invocation
+                    if ( ctx_map.count( "iinit_arg" ) > 0 ) {
+                        irods::kvp_map_t arg_map;
+                        ret = irods::parse_escaped_kvp_string( ctx_map["iinit_arg"], arg_map );
+                        if ( ret.ok() ) {
+                            if ( arg_map.count( "access_token" ) > 0 ) {
+                                ctx_map["access_token"] = arg_map["access_token"];
+                            }
+                            if ( arg_map.count( "user_key" ) > 0 ) {
+                                ctx_map["user_key"] = arg_map["user_key"];
+                            }
+                            std::string new_context_string = irods::escaped_kvp_string( ctx_map );
+                            rodsLog( DEBUG_FLAG, "new context using iinit_arg: ", new_context_string.c_str() );
+                            ptr->context( new_context_string.c_str() );
+                        }
+                        else {
+                            // the arg passed was not a kvp string
+                        }
+                    }
+                    else {
+                        // arg passed did not contain iinit_arg
+                        ptr->context( _context_string );
+                    }
+                }
             }
             else {
-                // No context sent, attempt to construct it now
+                // attempt to update context from client environment it now
+                rodsLog( LOG_NOTICE, "attempting to update context from client" );
+                //irods::kvp_map_t ctx_map;
                 // set the provider config to use, must match a provider configured on server
-                rodsLog( LOG_NOTICE, "attempting to build context from client" );
-                irods::kvp_map_t ctx_map;
                 try {
                     std::string client_provider_cfg = irods::get_environment_property<std::string&>( "openid_provider" );
                     ctx_map["provider"] = client_provider_cfg;
@@ -641,7 +676,7 @@ irods::error openid_auth_client_start(
                 int sess_ret = read_sess_file( sess );
 
                 if ( sess_ret < 0 || sess.size() == 0 ) {
-                    std::cout << "No cached session file" << std::endl;
+                    std::cout << "No client session file" << std::endl;
                     debug( "obfGetPw returned: " + std::to_string( sess_ret ) );
                 }
                 else {
@@ -650,13 +685,20 @@ irods::error openid_auth_client_start(
                     //ctx_map[irods::AUTH_PASSWORD_KEY] = sess;
                     const std::string OPENID_SESS_PREFIX_ACT( "act" );
                     const std::string OPENID_SESS_PREFIX_SID( "sid" );
+                    const std::string OPENID_SESS_PREFIX_UKEY( "ukey" );
                     irods::kvp_map_t client_sess_map;
                     irods::parse_escaped_kvp_string( sess, client_sess_map );
                     if ( client_sess_map.count( OPENID_SESS_PREFIX_ACT ) > 0 ) {
+                        debug( "adding access_token: " + client_sess_map[OPENID_SESS_PREFIX_ACT] );
                         ctx_map["access_token"] = client_sess_map[OPENID_SESS_PREFIX_ACT];
                     }
                     if ( client_sess_map.count( OPENID_SESS_PREFIX_SID ) > 0 ) {
+                        debug( "adding session_id: " + client_sess_map[OPENID_SESS_PREFIX_SID] );
                         ctx_map["session_id"] = client_sess_map[OPENID_SESS_PREFIX_SID];
+                    }
+                    if ( client_sess_map.count( OPENID_SESS_PREFIX_UKEY ) > 0 ) {
+                        debug( "adding user_key: " + client_sess_map[OPENID_SESS_PREFIX_UKEY] );
+                        ctx_map["user_key"] = client_sess_map[OPENID_SESS_PREFIX_UKEY];
                     }
                     if ( ctx_map.size() == 0 ) {
                         // fallback
@@ -1463,6 +1505,113 @@ irods::error user_has_session(
 }
 */
 
+irods::error validate_user_key(
+        const std::string& user_key,
+        const std::string& subject_id_in,
+        const std::string& user_name_in,
+        bool& is_valid,
+        long& status_code,
+        std::string& subject_id )
+{
+    irods::error result = SUCCESS();
+    irods::error ret;
+    std::string url;
+    ret = _get_openid_config_string( "token_service", url );
+    if ( !ret.ok() ) {
+        rodsLog( LOG_ERROR, "failed to look up token_service" );
+        return ret;
+    }
+    std::string api_key;
+    ret = _get_openid_config_string( "token_service_key", api_key );
+    if ( !ret.ok() ) {
+        rodsLog( LOG_ERROR, "failed to look up token_service_key" );
+        return ret;
+    }
+
+    // query apikey resource
+    url += "/apikey/verify";
+
+    // add params
+    std::string params;
+    if ( user_key.size() != 0 ) {
+        params += "key=" + user_key;
+    }
+    else {
+        return ERROR( SYS_INVALID_INPUT_PARAM, "user_key cannot be empty" );
+    }
+
+    if ( subject_id_in.size() != 0 ) {
+        params += "&uid=" + subject_id_in;
+    }
+    if ( user_name_in.size() != 0 ) {
+        params +=  "&username=" + user_name_in;
+    }
+
+    // create headers
+    std::vector<std::string> headers;
+    std::string authorization_header = "Authorization: Basic ";
+    authorization_header += api_key;
+    headers.push_back( authorization_header );
+
+    std::string curl_resp;
+    bool curl_ret = curl_get( url, &params, &headers, &curl_resp, &status_code );
+    if ( !curl_ret ) {
+        rodsLog( LOG_ERROR, "failed request to url %s, returned status %ld", url.c_str(), status_code );
+        return ERROR( -1, "failure in curl request to token service" );
+    }
+    else {
+        rodsLog( LOG_NOTICE, "request to token_service succeeded" );
+    }
+
+    if ( status_code != 200 ) {
+        std::ostringstream err_msg;
+        err_msg << "token service returned " << status_code << std::endl << curl_resp << std::endl;
+        rodsLog( LOG_ERROR, err_msg.str().c_str() );
+
+        if ( status_code == 401 ) {
+            is_valid = false;
+            return SUCCESS();
+        }
+    }
+
+    json_error_t json_err;
+    json_t *resp_root = json_loads( curl_resp.c_str(), 0, &json_err );
+    if ( resp_root == NULL ) {
+        std::ostringstream msg( "error parsing response from token service: " );
+        msg << json_err_message( json_err );
+        std::cout << "status code: " << status_code;
+        std::cout << std::endl << "response: "  << curl_resp;
+        rodsLog( LOG_ERROR, msg.str().c_str() );
+        return ERROR( -1, msg.str() );
+    }
+    
+    json_t *valid_obj = json_object_get( resp_root, "valid" );
+    if ( json_is_boolean( valid_obj ) ) {
+        is_valid = json_boolean_value( valid_obj );
+    }
+    else {
+        json_decref( resp_root );
+        return ERROR( -1, "no valid field returned in user key validation" );
+    }
+
+    // if not valid stop
+    if ( !is_valid ) {
+        json_decref( resp_root );
+        return SUCCESS();
+    }
+
+    json_t *uid_obj = json_object_get( resp_root, "uid" );
+    if ( json_is_string( uid_obj ) ) {
+        subject_id = json_string_value( uid_obj );
+    }
+    else {
+        json_decref( resp_root );
+        return ERROR( -1, "no uid field returned in user key validation" );
+    }
+    json_decref( resp_root );
+    return SUCCESS();
+}
+
 irods::error validate_user_token(
         rsComm_t *comm,
         const std::string& user_name,
@@ -1472,7 +1621,6 @@ irods::error validate_user_token(
         long& status_code,
         std::string& subject_id )
 {
-    debug( "entering validate_user_token" );
     irods::error result = SUCCESS();
     irods::error ret;
     std::string url;
@@ -1510,8 +1658,7 @@ irods::error validate_user_token(
 
     // create headers
     std::vector<std::string> headers;
-    std::string authorization_header = "Authorization: Basic ";
-    authorization_header += api_key;
+    std::string authorization_header = "Authorization: Basic " + api_key;
     headers.push_back( authorization_header );
     
     std::string curl_resp;
@@ -1534,14 +1681,9 @@ irods::error validate_user_token(
     json_error_t json_err;
     json_t *resp_root = json_loads( curl_resp.c_str(), 0, &json_err );
     if ( resp_root == NULL ) {
-        rodsLog( LOG_ERROR, "json_loads returned NULL" );
-        std::ostringstream msg;
-        msg << "error parsing response from token service: ";
+        std::ostringstream msg( "error parsing response from token service: " );
         msg << json_err_message( json_err );
-        std::cout << "status code: ";
-        std::cout << status_code;
-        std::cout << std::endl << "response: ";
-        std::cout << curl_resp;
+        std::cout << "status code: " << status_code << std::endl << "response: " << curl_resp;
         rodsLog( LOG_ERROR, msg.str().c_str() );
         return ERROR( -1, msg.str() );
     }
@@ -1583,6 +1725,7 @@ irods::error validate_user_token(
         result = SUCCESS();
     }
     else {
+        rodsLog( LOG_WARNING, "User does not have subject id corresponding to this openid token" );
         is_valid = false;
         result = SUCCESS();
     }
@@ -2157,7 +2300,9 @@ void open_write_to_port(
         std::string nonce,
         std::string access_token,
         std::string session_id,
-        std::string user_name )
+        std::string user_key,
+        std::string user_name,
+        bool reprompt )
 {
     std::unique_lock<std::mutex> lock(port_mutex);
 
@@ -2267,8 +2412,22 @@ void open_write_to_port(
     long status_code = -1;
     std::string subject_id;
 
-    // access_token takes precedent over session_id
-    if ( !access_token.empty() ) {
+    // user_key takes precedent over access_token which takes precedent over session_id
+    if ( !user_key.empty() ) {
+        // check user key
+        bool is_valid = false;
+        ret = validate_user_key(
+            user_key,
+            subject_id,
+            "",
+            is_valid,
+            status_code,
+            subject_id );
+
+        //ret = validate_user_key( user_key, is_valid, status_code, subject_id );
+        authorized = is_valid;
+    }
+    else if ( !access_token.empty() ) {
         bool is_valid = false;
         ret = validate_user_token( comm, user_name, openid_provider_name, access_token, is_valid, status_code, subject_id );
         authorized = is_valid;
@@ -2354,12 +2513,16 @@ void open_write_to_port(
         // send back user_name
         ssl_write_msg( ssl, user_name );
 
-        // send back session_id
+        // send back session info
         irods::kvp_map_t sess_map;
-        if ( !session_id.empty() ) {
+        // preference is user_key->session_id->access_token
+        if ( !user_key.empty() ) {
+            sess_map["ukey"] = user_key;
+        }
+        else if ( !session_id.empty() ) {
             sess_map["sid"] = session_id;
         }
-        if ( !access_token.empty() ) {
+        else if ( !access_token.empty() ) {
             sess_map["act"] = access_token;
         }
         std::string sess = irods::escaped_kvp_string( sess_map );
@@ -2372,7 +2535,14 @@ void open_write_to_port(
     } 
     if ( !authorized || status_code == 401 ) {
         rodsLog( LOG_NOTICE, "not authorized, user must re-authenticate" );
-
+        if ( !reprompt ) {
+            ssl_write_msg( ssl, "not authorized, user must re-authenticate" );
+            SSL_free( ssl );
+            SSL_CTX_free( ctx );
+            close( conn_sockfd );
+            close( sockfd );
+            return;
+        }
         // user either wasn't provided, wasn't valid, or the session was deactivated/invalid
         // user must re-authenticate
         ret = token_service_get_url( openid_provider_name, "openid", &status_code, &resp_root );
@@ -2567,6 +2737,12 @@ irods::error openid_auth_agent_request(
             access_token = ctx_map["access_token"];
             rodsLog( LOG_NOTICE, "openid agent received client token: [%s]", access_token.c_str() );
         }
+        std::string user_key;
+        if ( ctx_map.count( "user_key" ) ) {
+            user_key = ctx_map["user_key"];
+            rodsLog( LOG_NOTICE, "openid agent received client key: [%s]", user_key.c_str() );
+        }
+
         std::string user_name = ctx_map[irods::AUTH_USER_KEY];
         // set global field to the value the client requested
         if ( ctx_map.count( "provider" ) ) {
@@ -2581,6 +2757,14 @@ irods::error openid_auth_agent_request(
                 return ret;
             }
             rodsLog( LOG_NOTICE, "openid agent used default provider" );
+        }
+
+        // default to reprompting upon invalid session
+        // client can pass reprompt=0 to disable this, in which case
+        // one error message will be sent back, and then the connection terminated
+        bool reprompt = true;
+        if ( ctx_map.count( "reprompt" ) > 0 && ctx_map["reprompt"] == "0" ) {
+            reprompt = false;
         }
 
         /*
@@ -2607,7 +2791,9 @@ irods::error openid_auth_agent_request(
                             nonce,
                             access_token,
                             session_id,
-                            user_name);
+                            user_key,
+                            user_name,
+                            reprompt);
         while ( !port_opened ) {
             port_is_open_cond.wait(lock);
             std::cout << "cond woke up" << std::endl;
