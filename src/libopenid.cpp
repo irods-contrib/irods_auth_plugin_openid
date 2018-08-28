@@ -142,30 +142,39 @@ void write_log( const std::string& msg )
 /*
     Only systems with HOME defined
 */
-std::string sess_filename()
+irods::error sess_filename( std::string& path_out )
 {
+    debug( "entering sess_filename()" );
     char path[LONG_NAME_LEN + 1];
     memset( path, 0, LONG_NAME_LEN + 1 );
+    debug( "calling getRodsEnvAuthFileName()" );
     char *env = getRodsEnvAuthFileName();
     if ( env != NULL && *env != '\0' ) {
-        return std::string( env );
+        debug( "found valid env from irods" );
+        path_out = std::string( env );
     }
-
+    debug( "trying to call getenv(HOME)" );
     env = getenv( "HOME" );
-    debug( "HOME: " + std::string( env ) );
     if ( env == NULL ) {
-        throw std::runtime_error( "environment variable HOME not defined: "
-                + std::to_string( ENVIRONMENT_VAR_HOME_NOT_DEFINED ) );
+        rodsLog( LOG_WARNING, "environment variable HOME not defined" );
+        return ERROR( -1, "could not get auth filename" );
     }
+    debug( "HOME: " + std::string( env ) );
     strncpy( path, env, strlen( env ) );
     strncat( path, "/", MAX_NAME_LEN - strlen( path ) );
     strncat( path, AUTH_FILENAME_DEFAULT, MAX_NAME_LEN - strlen( path ) );
-    return std::string( path );
+    path_out = std::string( path );
+    return SUCCESS();
 }
 int write_sess_file( std::string val )
 {
     debug( "entering write_sess_file" );
-    FILE *fd = fopen( sess_filename().c_str(), "w+" );
+    std::string auth_file;
+    irods::error ret = sess_filename( auth_file );
+    if ( !ret.ok() ) {
+        return -3;
+    }
+    FILE *fd = fopen( auth_file.c_str(), "w+" );
     if ( !fd ) {
         perror( "could not open session file for writing" );
         return -1;
@@ -182,7 +191,12 @@ extern "C"
 int read_sess_file( std::string& val_out )
 {
     debug( "entering read_sess_file" );
-    FILE *fd = fopen( sess_filename().c_str(), "r" );
+    std::string auth_file;
+    irods::error ret = sess_filename( auth_file );
+    if ( !ret.ok() ) {
+        return -3;
+    }
+    FILE *fd = fopen( auth_file.c_str(), "r" );
     if ( !fd ) {
         perror( "could not open session file for reading" );
         return -1;
@@ -913,8 +927,19 @@ irods::error openid_auth_client_request(
                 // https://github.com/irods-contrib/irods_auth_plugin_openid/issues/5
                 // manually reading/writing session file
                 //int obfret = obfSavePw( 0, 0, 1, session_token.c_str() );
-                int a = write_sess_file( session_token );
-                debug( "got " + std::to_string( a ) + " from write_sess_file" );
+	        irods::kvp_map_t ctx_map;
+		irods::parse_escaped_kvp_string( context, ctx_map );
+		// don't rewrite session if nobuildctx passed
+		debug( "session_token: " + session_token );
+	        if ( ctx_map.count( "nobuildctx" ) == 0 ) {
+                    int a = write_sess_file( session_token );
+                    debug( "got " + std::to_string( a ) + " from write_sess_file" );
+                    if ( a < 0 ) {
+                        // don't treat as failure. Even if client doesn't pass nobuildctx, don't fail
+                        // just because it couldn't save the session file.
+                        rodsLog( LOG_WARNING, "Could not save the auth file for this session" );
+                    }
+		}
             }
             result = SUCCESS();
         }
