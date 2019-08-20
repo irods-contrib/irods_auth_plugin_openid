@@ -890,6 +890,7 @@ irods::error openid_auth_client_request(
     // handle errors and exit
     if ( status < 0 ) {
         result = ERROR( status, "call to rcAuthPluginRequest failed." );
+    }
     else {
 
         irods::kvp_map_t out_map;
