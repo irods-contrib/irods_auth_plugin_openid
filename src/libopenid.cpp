@@ -1204,7 +1204,7 @@ static irods::error _get_provider_config( std::string key, boost::any& cfg )
 
 
 /*
-    Looks for a server_config.json string corresponding to key, withing hte openid config section.
+    Looks for a server_config.json string corresponding to key, withing the openid config section.
     Sets buf to its value.
     If the config value for key is not a string, returns an error.
 */
