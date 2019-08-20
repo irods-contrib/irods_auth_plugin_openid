@@ -887,25 +887,25 @@ irods::error openid_auth_client_request(
     debug( "calling rcAuthPluginRequest" );
     int status = rcAuthPluginRequest( _comm, &req_in, &req_out );
 
-    irods::kvp_map_t out_map;
-    irods::parse_escaped_kvp_string( req_out->result_, out_map );
-    debug( "received comm info from server: port: [" + out_map["port"] + "], nonce: [" + out_map["nonce"] + "]" );
-    int portno = std::stoi( out_map["port"] );
-    std::string nonce = out_map["nonce"]; //
-
-    // perform authorization handshake with server
-    // server performs authorization, waits for client to authorize via url it returns via socket
-    // when client authorizes, server requests a token from OIDC provider and returns email+session token
-    std::string user_name, session_token;
-    debug( "attempting to read username and session token from server" );
-    read_from_server( portno, nonce, user_name, session_token );
-    ptr->user_name( user_name );
-
     // handle errors and exit
     if ( status < 0 ) {
         result = ERROR( status, "call to rcAuthPluginRequest failed." );
-    }
     else {
+
+        irods::kvp_map_t out_map;
+        irods::parse_escaped_kvp_string( req_out->result_, out_map );
+        debug( "received comm info from server: port: [" + out_map["port"] + "], nonce: [" + out_map["nonce"] + "]" );
+        int portno = std::stoi( out_map["port"] );
+        std::string nonce = out_map["nonce"]; //
+
+        // perform authorization handshake with server
+        // server performs authorization, waits for client to authorize via url it returns via socket
+        // when client authorizes, server requests a token from OIDC provider and returns email+session token
+        std::string user_name, session_token;
+        debug( "attempting to read username and session token from server" );
+        read_from_server( portno, nonce, user_name, session_token );
+        ptr->user_name( user_name );
+
         // check if session received is different from session sent
         irods::kvp_map_t context_map;
         ret = irods::parse_escaped_kvp_string( context, context_map );
