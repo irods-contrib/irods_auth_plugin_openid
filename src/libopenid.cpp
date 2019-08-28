@@ -916,12 +916,6 @@ irods::error openid_auth_client_request(
         }
         else {
             std::string original_sess = context_map[ irods::AUTH_PASSWORD_KEY ];
-            if ( session_token.size() > LONG_NAME_LEN ) {
-                throw std::runtime_error( "Session was too long: " + std::to_string( session_token.size() ) );
-            }
-
-            // copy it to the authStr field NAME_LEN=64
-            strncpy( _comm->clientUser.authInfo.authStr, session_token.c_str(), session_token.size() );
 
             if ( session_token.size() != 0 && session_token.compare( original_sess ) != 0 ) {
                 // server returned a new session token, because existing one is not valid
