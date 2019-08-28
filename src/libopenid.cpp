@@ -184,6 +184,7 @@ int write_sess_file( std::string val )
         printf( "Could not write value to session. Length was %lu but only wrote %lu\n", val.size(), n_char );
         return -2;
     }
+    fclose(fd);
     debug( "leaving write_sess_file" );
     return 0;
 }
@@ -221,6 +222,7 @@ int read_sess_file( std::string& val_out )
         //                    val_out.end(),
         //                    '\n' ),
         //               val_out.end() );
+        fclose(fd);
         debug( "leaving read_sess_file: " + val_out );
         return 0;
     }
