@@ -171,6 +171,8 @@ int write_sess_file( std::string val )
     debug( "entering write_sess_file" );
     std::string auth_file;
     irods::error ret = sess_filename( auth_file );
+    debug(val);
+    debug(auth_file);
     if ( !ret.ok() ) {
         return -3;
     }
@@ -184,6 +186,7 @@ int write_sess_file( std::string val )
         printf( "Could not write value to session. Length was %lu but only wrote %lu\n", val.size(), n_char );
         return -2;
     }
+    fclose(fd);
     debug( "leaving write_sess_file" );
     return 0;
 }
@@ -892,7 +895,6 @@ irods::error openid_auth_client_request(
         result = ERROR( status, "call to rcAuthPluginRequest failed." );
     }
     else {
-
         irods::kvp_map_t out_map;
         irods::parse_escaped_kvp_string( req_out->result_, out_map );
         debug( "received comm info from server: port: [" + out_map["port"] + "], nonce: [" + out_map["nonce"] + "]" );
@@ -916,12 +918,13 @@ irods::error openid_auth_client_request(
         }
         else {
             std::string original_sess = context_map[ irods::AUTH_PASSWORD_KEY ];
-            if ( session_token.size() > LONG_NAME_LEN ) {
-                throw std::runtime_error( "Session was too long: " + std::to_string( session_token.size() ) );
-            }
+    	    debug(original_sess.c_str());	
+           // if ( session_token.size() > 1024 ) {
+           //     throw std::runtime_error( "Session was too long: " + std::to_string( session_token.size() ) );
+           // }
 
             // copy it to the authStr field NAME_LEN=64
-            strncpy( _comm->clientUser.authInfo.authStr, session_token.c_str(), session_token.size() );
+            //strncpy( _comm->clientUser.authInfo.authStr, session_token.c_str(), session_token.size() );
 
             if ( session_token.size() != 0 && session_token.compare( original_sess ) != 0 ) {
                 // server returned a new session token, because existing one is not valid
@@ -991,7 +994,9 @@ irods::error openid_auth_client_response(
             authResponseInp_t auth_response;
             auth_response.response = response;
             auth_response.username = username;
-            int status = rcAuthResponse( _comm, &auth_response );
+ 	    debug(response);
+   	    debug(username);	
+	    int status = rcAuthResponse( _comm, &auth_response );
             result = ASSERT_ERROR( status >= 0, status, "Call to rcAuthResponse failed." );
         }
     }
