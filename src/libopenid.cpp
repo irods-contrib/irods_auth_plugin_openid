@@ -279,13 +279,16 @@ sslVerifyCallback( int ok, X509_STORE_CTX *store ) {
         rodsLog( LOG_NOTICE, "sslVerifyCallback:   err %i:%s", err,
                  X509_verify_cert_error_string( err ) );
     }
-
+    //rgh
+    rodsLog ( LOG_NOTICE, "sslVerifyCallback: All is ok");
     return ok;
 }
 
 
 static SSL_CTX*
 sslInit( char *certfile, char *keyfile ) {
+    //rgh
+    rodsLog (LOG_NOTICE, "sslInit: Starting function");
     static int init_done = 0;
     rodsEnv env;
     int status = getRodsEnv( &env );
@@ -359,6 +362,8 @@ sslInit( char *certfile, char *keyfile ) {
         return NULL;
     }
 
+    rodsLog (LOG_NOTICE, "sslInit: Ending function with ctx");
+
     return ctx;
 }
 
@@ -393,14 +398,23 @@ int ssl_write_msg( SSL* ssl, const std::string& msg )
     return msg_len;
 }
 
-
-int ssl_read_msg( SSL* ssl, std::string& msg_out )
+//rgh, this function is not being called because of a name clash with 
+//lib/core/src/clientLogin.cpp:ssl_read_msg in irods 4.2.3 (removed in later versions of irods)
+//The function being called is returning 0 bytes read, no error. I suspect issues with the certificate.
+//
+//Strangely, if I rename this function the libraries cannot be built. 
+//The dynamic linker seems to be making a mistake here.
+//
+//Renaming function and all usages
+int ssl_read_msg_OPENIDPLUGIN( SSL* ssl, std::string& msg_out )
 {
     const int READ_LEN = 256;
     char buffer[READ_LEN + 1];
     int n_bytes = 0;
     int total_bytes = 0;
     int data_len = 0;
+    rodsLog (LOG_NOTICE, "ssl_read_msg: starting");
+
     SSL_read( ssl, &data_len, sizeof( data_len ) );
     std::string msg;
     // read that many bytes into our buffer
@@ -424,10 +438,14 @@ int ssl_read_msg( SSL* ssl, std::string& msg_out )
             break;
         }
         debug( "received " + std::to_string( n_bytes ) + " bytes: " + std::string( buffer ) );
+        rodsLog (LOG_NOTICE, "ssl_read_msg: received %d bytes", n_bytes);
+
         msg.append( buffer );
         total_bytes += n_bytes;
     }
     msg_out = msg;
+    rodsLog (LOG_NOTICE, "ssl_read_msg: received total %d bytes, returning", total_bytes);
+
     return total_bytes;
 }
 
@@ -549,7 +567,7 @@ void read_from_server(
 
     // read first 4 bytes (data length)
     std::string authorization_url_buf;
-    if ( ssl_read_msg( ssl, authorization_url_buf ) < 0 ) {
+    if ( ssl_read_msg_OPENIDPLUGIN( ssl, authorization_url_buf ) < 0 ) {
         perror( "error reading url from socket" );
         return;
     }
@@ -565,14 +583,14 @@ void read_from_server(
     }
 
     // wait for username message now
-    if ( ssl_read_msg( ssl, user_name ) < 0 ) {
+    if ( ssl_read_msg_OPENIDPLUGIN( ssl, user_name ) < 0 ) {
         perror( "error reading username from server" );
         return;
     }
     debug( "read user_name: " + user_name );
 
     // wait for session token now
-    int len = ssl_read_msg( ssl, session_token );
+    int len = ssl_read_msg_OPENIDPLUGIN( ssl, session_token );
     if ( len < 0 ) {
         perror( "error reading session token from server" );
         return;
@@ -1952,7 +1970,7 @@ irods::error get_username_by_session_id( rsComm_t *comm, std::string session_id,
 
 /*
     Lookup the metadata id (meta_id in r_meta_main) for the openid session with session_id and scope.
-    Those fields should be enought to identify a distinct entry.
+    Those fields should be enough to identify a distinct entry.
 */
 irods::error get_token_meta_id(
                 rsComm_t *comm,
@@ -2419,7 +2437,8 @@ void open_write_to_port(
 
     // verify client nonce matches the nonce we sent back from auth_agent_request
     std::string client_nonce;
-    if ( ssl_read_msg( ssl, client_nonce ) < 0 ) {
+    rodsLog( LOG_NOTICE, "open_write_to_port: before ssl_read_msg client_nonce");
+    if ( ssl_read_msg_OPENIDPLUGIN( ssl, client_nonce ) < 0 ) {
         perror( "error reading nonce from client" );
         SSL_free( ssl );
         SSL_CTX_free( ctx );
@@ -2427,11 +2446,11 @@ void open_write_to_port(
         close( sockfd );
         return;
     }
-    rodsLog( DEBUG_FLAG, "received nonce from client: %s", client_nonce.c_str() );
+    rodsLog( DEBUG_FLAG, "received nonce from client: [%s]", client_nonce.c_str() );
 
     if ( nonce.compare( client_nonce ) != 0 ) {
         rodsLog( LOG_WARNING,
-                 "Received connection on port %d from with invalid nonce. Expected [%s] but got [%s]",
+                 "Received connection on port %d with invalid nonce. Expected [%s] but got [%s]",
                  *portno,
                  nonce.c_str(),
                  client_nonce.c_str() );
