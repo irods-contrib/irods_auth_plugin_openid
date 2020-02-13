@@ -64,5 +64,5 @@ On the commend line, after iinit is run, the token should be hashed (e.g. by usi
 https://github.com/RubenGarcia/python-irodsclient/tree/openid/examples/iinit
 
 If you plan to use the python client, 
-See https://github.com/RubenGarcia/python-irodsclient
+https://github.com/RubenGarcia/python-irodsclient
 will hash the token automatically if it is larger than 1024 bytes.
