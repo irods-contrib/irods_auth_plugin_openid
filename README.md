@@ -36,3 +36,33 @@ Now this plugin can be installed on an iRODS server, and on the client system wh
 3. Log in at the OpenID identity provider's website using the url.
 4. The iinit command will exit.
 5. Run any other iRODS client commands, which will now have the permissions of your iRODS account associated with the OpenID account in the pre-requisite steps.
+
+## Further comments
+
+### Interaction with high-availability setups
+
+If you use this plugin in combination with a high-availability irods setup such as 
+https://irods.org/2015/07/configuring-irods-for-high-availability/
+then you need to ensure that users stay on the same back-end service.
+This is strictly only needed during the authentification phase (as a direct network connection is made to submit the nonce),
+but it does not hurt setting it globally.
+
+For haproxy, the needed lines are: 
+	balance source
+	hash-type consistent
+in the backend section.
+
+
+### Interaction with keycloak
+
+Keycloak produces large tokens which do not fit in the iRODS username field. See
+https://indico.cern.ch/event/854707/contributions/3681126/
+for details.
+
+In this case, tokens should be pre-authorized with the broker service and hashed prior to submission to iRODS.
+On the commend line, after iinit is run, the token should be hashed (e.g. by using the example script at
+https://github.com/RubenGarcia/python-irodsclient/tree/openid/examples/iinit
+
+If you plan to use the python client, 
+See https://github.com/RubenGarcia/python-irodsclient
+will hash the token automatically if it is larger than 1024 bytes.
