@@ -2266,9 +2266,10 @@ int bind_port( int min_port, int max_port, int *port_out, int *sock_out )
         }
         //auto rng = randint;
         std::srand( time( NULL ) );
-        auto rng = [](int i){ return std::rand() % i; };
         //rng.seed( time( NULL ) );
-        std::random_shuffle( ports.begin(), ports.end(), rng );
+	//RGH: std::random_shuffle removed on C++17
+	std::random_device rd;
+        std::shuffle( ports.begin(), ports.end(), rd );
         bool bound = false;
         for ( auto iter = ports.begin(); iter != ports.end(); iter++ ) {
             serv_addr.sin_port = htons( *iter );
