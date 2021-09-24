@@ -2267,8 +2267,7 @@ int bind_port( int min_port, int max_port, int *port_out, int *sock_out )
         for ( int i = min_port; i <= max_port; i++ ) {
             ports.push_back( i );
         }
-        	
-	std::shuffle( ports.begin(), ports.end(), rng );
+        std::shuffle( ports.begin(), ports.end(), rng );
         bool bound = false;
         for ( auto iter = ports.begin(); iter != ports.end(); iter++ ) {
             serv_addr.sin_port = htons( *iter );
