@@ -2234,6 +2234,9 @@ int bind_port( int min_port, int max_port, int *port_out, int *sock_out )
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_addr.s_addr = INADDR_ANY;
     // single port specified (min==max)
+    
+    std::random_device rd;
+    std::mt19937 rng(rd());
     if ( min_port == max_port ) {
         serv_addr.sin_port = htons( min_port );
         ret = bind( sockfd, (struct sockaddr*)&serv_addr, sizeof( serv_addr ) );
@@ -2264,11 +2267,8 @@ int bind_port( int min_port, int max_port, int *port_out, int *sock_out )
         for ( int i = min_port; i <= max_port; i++ ) {
             ports.push_back( i );
         }
-        //auto rng = randint;
-        std::srand( time( NULL ) );
-        auto rng = [](int i){ return std::rand() % i; };
-        //rng.seed( time( NULL ) );
-        std::random_shuffle( ports.begin(), ports.end(), rng );
+        	
+	std::shuffle( ports.begin(), ports.end(), rng );
         bool bound = false;
         for ( auto iter = ports.begin(); iter != ports.end(); iter++ ) {
             serv_addr.sin_port = htons( *iter );
