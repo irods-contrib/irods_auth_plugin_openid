@@ -55,6 +55,10 @@
 #include <boost/algorithm/string.hpp>
 #include "base64.h"
 #include "jansson.h"
+#include <openssl/sha.h>
+#include <iostream>
+#include <iomanip>
+#include <sstream>
 
 /*Adding for manual queries to r_user_session_key
  */
@@ -139,6 +143,8 @@ void write_log( const std::string& msg )
 }
 
 
+
+
 /*
     Only systems with HOME defined
 */
@@ -171,6 +177,8 @@ int write_sess_file( std::string val )
     debug( "entering write_sess_file" );
     std::string auth_file;
     irods::error ret = sess_filename( auth_file );
+    debug(val);
+    debug(auth_file);
     if ( !ret.ok() ) {
         return -3;
     }
@@ -184,6 +192,7 @@ int write_sess_file( std::string val )
         printf( "Could not write value to session. Length was %lu but only wrote %lu\n", val.size(), n_char );
         return -2;
     }
+    fclose(fd);
     debug( "leaving write_sess_file" );
     return 0;
 }
@@ -276,13 +285,16 @@ sslVerifyCallback( int ok, X509_STORE_CTX *store ) {
         rodsLog( LOG_NOTICE, "sslVerifyCallback:   err %i:%s", err,
                  X509_verify_cert_error_string( err ) );
     }
-
+    //rgh
+    rodsLog ( LOG_NOTICE, "sslVerifyCallback: All is ok");
     return ok;
 }
 
 
 static SSL_CTX*
 sslInit( char *certfile, char *keyfile ) {
+    //rgh
+    rodsLog (LOG_NOTICE, "sslInit: Starting function");
     static int init_done = 0;
     rodsEnv env;
     int status = getRodsEnv( &env );
@@ -356,6 +368,8 @@ sslInit( char *certfile, char *keyfile ) {
         return NULL;
     }
 
+    rodsLog (LOG_NOTICE, "sslInit: Ending function with ctx");
+
     return ctx;
 }
 
@@ -390,14 +404,23 @@ int ssl_write_msg( SSL* ssl, const std::string& msg )
     return msg_len;
 }
 
-
-int ssl_read_msg( SSL* ssl, std::string& msg_out )
+//rgh, this function is not being called because of a name clash with 
+//lib/core/src/clientLogin.cpp:ssl_read_msg in irods 4.2.3 (removed in later versions of irods)
+//The function being called is returning 0 bytes read, no error. I suspect issues with the certificate.
+//
+//Strangely, if I rename this function the libraries cannot be built. 
+//The dynamic linker seems to be making a mistake here.
+//
+//Renaming function and all usages
+int ssl_read_msg_OPENIDPLUGIN( SSL* ssl, std::string& msg_out )
 {
     const int READ_LEN = 256;
     char buffer[READ_LEN + 1];
     int n_bytes = 0;
     int total_bytes = 0;
     int data_len = 0;
+    rodsLog (LOG_NOTICE, "ssl_read_msg: starting");
+
     SSL_read( ssl, &data_len, sizeof( data_len ) );
     std::string msg;
     // read that many bytes into our buffer
@@ -421,10 +444,14 @@ int ssl_read_msg( SSL* ssl, std::string& msg_out )
             break;
         }
         debug( "received " + std::to_string( n_bytes ) + " bytes: " + std::string( buffer ) );
+        rodsLog (LOG_NOTICE, "ssl_read_msg: received %d bytes", n_bytes);
+
         msg.append( buffer );
         total_bytes += n_bytes;
     }
     msg_out = msg;
+    rodsLog (LOG_NOTICE, "ssl_read_msg: received total %d bytes, returning", total_bytes);
+
     return total_bytes;
 }
 
@@ -546,7 +573,7 @@ void read_from_server(
 
     // read first 4 bytes (data length)
     std::string authorization_url_buf;
-    if ( ssl_read_msg( ssl, authorization_url_buf ) < 0 ) {
+    if ( ssl_read_msg_OPENIDPLUGIN( ssl, authorization_url_buf ) < 0 ) {
         perror( "error reading url from socket" );
         return;
     }
@@ -562,14 +589,14 @@ void read_from_server(
     }
 
     // wait for username message now
-    if ( ssl_read_msg( ssl, user_name ) < 0 ) {
+    if ( ssl_read_msg_OPENIDPLUGIN( ssl, user_name ) < 0 ) {
         perror( "error reading username from server" );
         return;
     }
     debug( "read user_name: " + user_name );
 
     // wait for session token now
-    int len = ssl_read_msg( ssl, session_token );
+    int len = ssl_read_msg_OPENIDPLUGIN( ssl, session_token );
     if ( len < 0 ) {
         perror( "error reading session token from server" );
         return;
@@ -769,6 +796,37 @@ irods::error _hex_from_binary( const char* in, size_t in_len, std::string& out )
 }
 
 /*
+    Hash access token before writing it to the session file
+*/
+std::string hash_sess_file(std::string sess_content)
+{
+    // Session file should contain the token and session id like this:
+    // act=<token>;sid=<session id>
+    // Parse the iRODS session and hash the token
+    
+    std::stringstream result;
+    std::string hexdump;
+    
+    // Look for ;
+    auto sep_pos = sess_content.find(';');
+    
+    // Extract act and sid
+    std::string act = sess_content.substr(0, sep_pos);
+    std::string sid = sess_content.substr(sep_pos + 1, sess_content.size() - 1);
+    
+    // Cut 'act='
+    act = act.substr(act.find('=') + 1, act.size() - 1);
+    
+    // Hash and get hexdump
+    char act_hash[33];
+    _sha256_hash(act, act_hash);
+    _hex_from_binary(act_hash, 32, hexdump);
+   
+    result << "act=" << hexdump << ";" << sid;
+    return result.str();
+}
+
+/*
     Base64 encode a string and put it in the out reference. Handle padding and length nicely.
 */
 irods::error _base64_easy_encode( const char* in, size_t in_len, std::string& out )
@@ -892,7 +950,6 @@ irods::error openid_auth_client_request(
         result = ERROR( status, "call to rcAuthPluginRequest failed." );
     }
     else {
-
         irods::kvp_map_t out_map;
         irods::parse_escaped_kvp_string( req_out->result_, out_map );
         debug( "received comm info from server: port: [" + out_map["port"] + "], nonce: [" + out_map["nonce"] + "]" );
@@ -916,12 +973,13 @@ irods::error openid_auth_client_request(
         }
         else {
             std::string original_sess = context_map[ irods::AUTH_PASSWORD_KEY ];
-            if ( session_token.size() > LONG_NAME_LEN ) {
-                throw std::runtime_error( "Session was too long: " + std::to_string( session_token.size() ) );
-            }
+    	    debug(original_sess.c_str());	
+           // if ( session_token.size() > 1024 ) {
+           //     throw std::runtime_error( "Session was too long: " + std::to_string( session_token.size() ) );
+           // }
 
             // copy it to the authStr field NAME_LEN=64
-            strncpy( _comm->clientUser.authInfo.authStr, session_token.c_str(), session_token.size() );
+            //strncpy( _comm->clientUser.authInfo.authStr, session_token.c_str(), session_token.size() );
 
             if ( session_token.size() != 0 && session_token.compare( original_sess ) != 0 ) {
                 // server returned a new session token, because existing one is not valid
@@ -933,7 +991,8 @@ irods::error openid_auth_client_request(
 		// don't rewrite session if nobuildctx passed
 		debug( "session_token: " + session_token );
 	        if ( ctx_map.count( "nobuildctx" ) == 0 ) {
-                    int a = write_sess_file( session_token );
+                    // Hash the token before writing
+                    int a = write_sess_file( hash_sess_file(session_token) );
                     debug( "got " + std::to_string( a ) + " from write_sess_file" );
                     if ( a < 0 ) {
                         // don't treat as failure. Even if client doesn't pass nobuildctx, don't fail
@@ -991,7 +1050,9 @@ irods::error openid_auth_client_response(
             authResponseInp_t auth_response;
             auth_response.response = response;
             auth_response.username = username;
-            int status = rcAuthResponse( _comm, &auth_response );
+ 	    debug(response);
+   	    debug(username);	
+	    int status = rcAuthResponse( _comm, &auth_response );
             result = ASSERT_ERROR( status >= 0, status, "Call to rcAuthResponse failed." );
         }
     }
@@ -1947,7 +2008,7 @@ irods::error get_username_by_session_id( rsComm_t *comm, std::string session_id,
 
 /*
     Lookup the metadata id (meta_id in r_meta_main) for the openid session with session_id and scope.
-    Those fields should be enought to identify a distinct entry.
+    Those fields should be enough to identify a distinct entry.
 */
 irods::error get_token_meta_id(
                 rsComm_t *comm,
@@ -2211,6 +2272,9 @@ int bind_port( int min_port, int max_port, int *port_out, int *sock_out )
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_addr.s_addr = INADDR_ANY;
     // single port specified (min==max)
+    
+    std::random_device rd;
+    std::mt19937 rng(rd());
     if ( min_port == max_port ) {
         serv_addr.sin_port = htons( min_port );
         ret = bind( sockfd, (struct sockaddr*)&serv_addr, sizeof( serv_addr ) );
@@ -2241,11 +2305,7 @@ int bind_port( int min_port, int max_port, int *port_out, int *sock_out )
         for ( int i = min_port; i <= max_port; i++ ) {
             ports.push_back( i );
         }
-        //auto rng = randint;
-        std::srand( time( NULL ) );
-        auto rng = [](int i){ return std::rand() % i; };
-        //rng.seed( time( NULL ) );
-        std::random_shuffle( ports.begin(), ports.end(), rng );
+        std::shuffle( ports.begin(), ports.end(), rng );
         bool bound = false;
         for ( auto iter = ports.begin(); iter != ports.end(); iter++ ) {
             serv_addr.sin_port = htons( *iter );
@@ -2414,7 +2474,8 @@ void open_write_to_port(
 
     // verify client nonce matches the nonce we sent back from auth_agent_request
     std::string client_nonce;
-    if ( ssl_read_msg( ssl, client_nonce ) < 0 ) {
+    rodsLog( LOG_NOTICE, "open_write_to_port: before ssl_read_msg client_nonce");
+    if ( ssl_read_msg_OPENIDPLUGIN( ssl, client_nonce ) < 0 ) {
         perror( "error reading nonce from client" );
         SSL_free( ssl );
         SSL_CTX_free( ctx );
@@ -2422,11 +2483,11 @@ void open_write_to_port(
         close( sockfd );
         return;
     }
-    rodsLog( DEBUG_FLAG, "received nonce from client: %s", client_nonce.c_str() );
+    rodsLog( DEBUG_FLAG, "received nonce from client: [%s]", client_nonce.c_str() );
 
     if ( nonce.compare( client_nonce ) != 0 ) {
         rodsLog( LOG_WARNING,
-                 "Received connection on port %d from with invalid nonce. Expected [%s] but got [%s]",
+                 "Received connection on port %d with invalid nonce. Expected [%s] but got [%s]",
                  *portno,
                  nonce.c_str(),
                  client_nonce.c_str() );
