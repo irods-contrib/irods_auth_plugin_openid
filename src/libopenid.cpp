@@ -55,6 +55,10 @@
 #include <boost/algorithm/string.hpp>
 #include "base64.h"
 #include "jansson.h"
+#include <openssl/sha.h>
+#include <iostream>
+#include <iomanip>
+#include <sstream>
 
 /*Adding for manual queries to r_user_session_key
  */
@@ -137,6 +141,8 @@ void write_log( const std::string& msg )
     logfile << msg << std::endl;
     logfile.close();
 }
+
+
 
 
 /*
@@ -790,6 +796,37 @@ irods::error _hex_from_binary( const char* in, size_t in_len, std::string& out )
 }
 
 /*
+    Hash access token before writing it to the session file
+*/
+std::string hash_sess_file(std::string sess_content)
+{
+    // Session file should contain the token and session id like this:
+    // act=<token>;sid=<session id>
+    // Parse the iRODS session and hash the token
+    
+    std::stringstream result;
+    std::string hexdump;
+    
+    // Look for ;
+    auto sep_pos = sess_content.find(';');
+    
+    // Extract act and sid
+    std::string act = sess_content.substr(0, sep_pos);
+    std::string sid = sess_content.substr(sep_pos + 1, sess_content.size() - 1);
+    
+    // Cut 'act='
+    act = act.substr(act.find('=') + 1, act.size() - 1);
+    
+    // Hash and get hexdump
+    char act_hash[33];
+    _sha256_hash(act, act_hash);
+    _hex_from_binary(act_hash, 32, hexdump);
+   
+    result << "act=" << hexdump << ";" << sid;
+    return result.str();
+}
+
+/*
     Base64 encode a string and put it in the out reference. Handle padding and length nicely.
 */
 irods::error _base64_easy_encode( const char* in, size_t in_len, std::string& out )
@@ -954,7 +991,8 @@ irods::error openid_auth_client_request(
 		// don't rewrite session if nobuildctx passed
 		debug( "session_token: " + session_token );
 	        if ( ctx_map.count( "nobuildctx" ) == 0 ) {
-                    int a = write_sess_file( session_token );
+                    // Hash the token before writing
+                    int a = write_sess_file( hash_sess_file(session_token) );
                     debug( "got " + std::to_string( a ) + " from write_sess_file" );
                     if ( a < 0 ) {
                         // don't treat as failure. Even if client doesn't pass nobuildctx, don't fail
